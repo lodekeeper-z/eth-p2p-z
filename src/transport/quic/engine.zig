@@ -13,6 +13,12 @@ const builtin = @import("builtin");
 const log = std.log.scoped(.quic_engine);
 
 const lsquic = @cImport({
+    // Must match the macro defined when compiling the lsquic C library
+    // (see zig-pkg/lsquic-*/build.zig). Without this, translate-c omits
+    // the es_webtransport_server and es_max_webtransport_server_streams
+    // fields from lsquic_engine_settings, causing a struct-size mismatch
+    // that overwrites the stack canary in ReleaseSafe builds.
+    @cDefine("LSQUIC_WEBTRANSPORT_SERVER_SUPPORT", "1");
     @cInclude("lsquic.h");
     @cInclude("lsquic_types.h");
 });
@@ -341,6 +347,62 @@ pub const QuicEngine = struct {
         host_key: ?*ssl.EVP_PKEY = null,
     };
 
+    /// Loads a libp2p TLS certificate into the given SSL_CTX.
+    ///
+    /// MUST be `noinline`: in ReleaseSafe builds, LLVM speculatively hoists
+    /// safety-checked operations (e.g. @intCast) from inside this block to
+    /// outside the `if (host_key != null)` guard in init(), causing a
+    /// compiler_rt panic for callers that don't provide a host key. Marking
+    /// the function noinline creates an ABI boundary that prevents this.
+    noinline fn loadLibp2pTlsCert(
+        allocator: Allocator,
+        ssl_ctx: *ssl.SSL_CTX,
+        host_key: *ssl.EVP_PKEY,
+    ) !void {
+        // Generate a fresh ECDSA subject key for this TLS certificate.
+        // The subject key is ephemeral: BoringSSL calls EVP_PKEY_up_ref when we
+        // load it via SSL_CTX_use_PrivateKey, so we release our reference
+        // explicitly on every code path rather than using `defer` (which the
+        // ReleaseSafe optimizer can hoist past C function calls).
+        const subject_key = tls.generateKeyPair(.ECDSA) catch return error.KeyGenFailed;
+
+        var host_pubkey = tls.createProtobufEncodedPublicKey(allocator, host_key) catch {
+            ssl.EVP_PKEY_free(subject_key);
+            return error.KeyEncodeFailed;
+        };
+        defer if (host_pubkey.data) |d| allocator.free(d);
+
+        const cert = tls.buildCert(
+            allocator,
+            &host_pubkey,
+            @as(?*anyopaque, @ptrCast(host_key)),
+            tls.signDataWithTlsKey,
+            subject_key,
+        ) catch {
+            ssl.EVP_PKEY_free(subject_key);
+            return error.CertBuildFailed;
+        };
+        defer ssl.X509_free(cert);
+
+        // Debug: dump PEM cert for interop analysis
+        if (tls.x509ToPem(allocator, cert)) |pem| {
+            defer allocator.free(pem);
+            log.debug("Generated TLS cert:\n{s}", .{pem});
+        } else |_| {}
+
+        if (ssl.SSL_CTX_use_certificate(ssl_ctx, cert) <= 0) {
+            ssl.EVP_PKEY_free(subject_key);
+            return error.CertLoadFailed;
+        }
+        if (ssl.SSL_CTX_use_PrivateKey(ssl_ctx, subject_key) <= 0) {
+            ssl.EVP_PKEY_free(subject_key);
+            return error.KeyLoadFailed;
+        }
+        // BoringSSL has taken its own reference via EVP_PKEY_up_ref.
+        // Release ours.
+        ssl.EVP_PKEY_free(subject_key);
+    }
+
     pub fn init(allocator: Allocator, config: Config) !*QuicEngine {
         // Initialize lsquic global state (safe to call multiple times)
         if (lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER) != 0) {
@@ -430,36 +492,14 @@ pub const QuicEngine = struct {
             customVerifyCallback,
         );
 
-        // Load libp2p TLS certificate if host key is provided
+        // Load libp2p TLS certificate if host key is provided.
+        // Extracted into a noinline helper to prevent the ReleaseSafe optimizer
+        // from speculatively executing cert-loading code (with @intCast safety
+        // checks) outside the `if (host_key != null)` guard, causing crashes
+        // in tests that don't provide a host key.
         if (config.host_key) |host_key| {
-            const subject_key = tls.generateKeyPair(.ECDSA) catch return error.KeyGenFailed;
-            defer ssl.EVP_PKEY_free(subject_key);
-
-            var host_pubkey = tls.createProtobufEncodedPublicKey(allocator, host_key) catch
-                return error.KeyEncodeFailed;
-            defer if (host_pubkey.data) |d| allocator.free(d);
-
-            const cert = tls.buildCert(
-                allocator,
-                &host_pubkey,
-                @as(?*anyopaque, @ptrCast(host_key)),
-                tls.signDataWithTlsKey,
-                subject_key,
-            ) catch return error.CertBuildFailed;
-            defer ssl.X509_free(cert);
-
-            // Debug: dump PEM cert for interop analysis
-            if (tls.x509ToPem(allocator, cert)) |pem| {
-                defer allocator.free(pem);
-                log.debug("Generated TLS cert:\n{s}", .{pem});
-            } else |_| {}
-
-            if (ssl.SSL_CTX_use_certificate(self.ssl_ctx, cert) <= 0)
-                return error.CertLoadFailed;
-            if (ssl.SSL_CTX_use_PrivateKey(self.ssl_ctx, subject_key) <= 0)
-                return error.KeyLoadFailed;
+            try loadLibp2pTlsCert(allocator, self.ssl_ctx, host_key);
         }
-
         // Configure engine settings
         var settings: lsquic.lsquic_engine_settings = undefined;
         lsquic.lsquic_engine_init_settings(&settings, if (config.is_server) lsquic.LSENG_SERVER else 0);

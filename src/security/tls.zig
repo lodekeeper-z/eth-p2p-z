@@ -152,7 +152,12 @@ pub fn buildCert(
 
     // Generate a pseudo-unique serial based on the subject key pointer.
     // For libp2p self-signed certs, uniqueness across the node is sufficient.
-    const random_serial: i64 = @intCast(@intFromPtr(subjectKey) ^ @as(usize, 0x5DEECE66D));
+    // Use @bitCast instead of @intCast: in ReleaseSafe builds, @intCast checks
+    // that the value fits in the destination type. On systems where the pointer
+    // XOR produces a value with bit 63 set, @intCast(usize -> i64) would panic.
+    // @bitCast reinterprets the bits without a range check, which is safe for
+    // a certificate serial number (sign doesn't matter for X.509 serials).
+    const random_serial: i64 = @bitCast(@intFromPtr(subjectKey) ^ @as(usize, 0x5DEECE66D));
 
     if (ssl.ASN1_INTEGER_set_int64(serial, random_serial) <= 0) return error.CertSerialSetFailed;
     if (ssl.X509_set_serialNumber(cert, serial) <= 0) return error.CertSerialSetFailed;
