@@ -55,11 +55,112 @@ const unsent_retry_interval_ms: i64 = 10;
 /// application stream reader is rescheduled.
 const stream_read_queue_capacity: usize = 8192;
 
+pub const QuicDebugStats = struct {
+    timer_immediate_count: u64 = 0,
+    timer_timeout_count: u64 = 0,
+    timer_indefinite_count: u64 = 0,
+    current_consecutive_immediate_ticks: u64 = 0,
+    max_consecutive_immediate_ticks: u64 = 0,
+    advisory_tick_count: u64 = 0,
+    latest_advisory_diff_us: ?i64 = null,
+    min_advisory_diff_us: ?i64 = null,
+    max_advisory_diff_us: ?i64 = null,
+    process_engine_count: u64 = 0,
+    process_engine_reentrant_skip_count: u64 = 0,
+    process_engine_total_ns: u64 = 0,
+    process_engine_max_ns: u64 = 0,
+    on_read_count: u64 = 0,
+    on_read_bytes: u64 = 0,
+    on_read_would_block_count: u64 = 0,
+    on_read_zero_before_data_count: u64 = 0,
+    on_read_eof_count: u64 = 0,
+    read_queue_full_count: u64 = 0,
+    read_queue_closed_count: u64 = 0,
+    accept_queue_full_count: u64 = 0,
+    accept_queue_closed_count: u64 = 0,
+    packets_out_call_count: u64 = 0,
+    packets_out_sent_count: u64 = 0,
+    packets_out_eagain_count: u64 = 0,
+    packets_out_error_count: u64 = 0,
+    has_unsent_retry_count: u64 = 0,
+};
+
+const DebugCounters = struct {
+    timer_immediate_count: std.atomic.Value(u64) = .init(0),
+    timer_timeout_count: std.atomic.Value(u64) = .init(0),
+    timer_indefinite_count: std.atomic.Value(u64) = .init(0),
+    current_consecutive_immediate_ticks: std.atomic.Value(u64) = .init(0),
+    max_consecutive_immediate_ticks: std.atomic.Value(u64) = .init(0),
+    advisory_tick_count: std.atomic.Value(u64) = .init(0),
+    latest_advisory_diff_us: std.atomic.Value(i64) = .init(0),
+    min_advisory_diff_us: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
+    max_advisory_diff_us: std.atomic.Value(i64) = .init(std.math.minInt(i64)),
+    process_engine_count: std.atomic.Value(u64) = .init(0),
+    process_engine_reentrant_skip_count: std.atomic.Value(u64) = .init(0),
+    process_engine_total_ns: std.atomic.Value(u64) = .init(0),
+    process_engine_max_ns: std.atomic.Value(u64) = .init(0),
+    on_read_count: std.atomic.Value(u64) = .init(0),
+    on_read_bytes: std.atomic.Value(u64) = .init(0),
+    on_read_would_block_count: std.atomic.Value(u64) = .init(0),
+    on_read_zero_before_data_count: std.atomic.Value(u64) = .init(0),
+    on_read_eof_count: std.atomic.Value(u64) = .init(0),
+    read_queue_full_count: std.atomic.Value(u64) = .init(0),
+    read_queue_closed_count: std.atomic.Value(u64) = .init(0),
+    accept_queue_full_count: std.atomic.Value(u64) = .init(0),
+    accept_queue_closed_count: std.atomic.Value(u64) = .init(0),
+    packets_out_call_count: std.atomic.Value(u64) = .init(0),
+    packets_out_sent_count: std.atomic.Value(u64) = .init(0),
+    packets_out_eagain_count: std.atomic.Value(u64) = .init(0),
+    packets_out_error_count: std.atomic.Value(u64) = .init(0),
+    has_unsent_retry_count: std.atomic.Value(u64) = .init(0),
+};
+
 const ProcessWait = union(enum) {
     immediate,
     indefinite,
     timeout_us: i64,
 };
+
+fn counterInc(counter: *std.atomic.Value(u64)) void {
+    _ = counter.fetchAdd(1, .monotonic);
+}
+
+fn counterAdd(counter: *std.atomic.Value(u64), amount: u64) void {
+    _ = counter.fetchAdd(amount, .monotonic);
+}
+
+fn updateMax(counter: *std.atomic.Value(u64), value: u64) void {
+    var current = counter.load(.monotonic);
+    while (value > current) {
+        current = counter.cmpxchgWeak(current, value, .monotonic, .monotonic) orelse return;
+    }
+}
+
+fn updateAdvisoryStats(counters: *DebugCounters, diff: c_int) void {
+    const value: i64 = @intCast(diff);
+    counterInc(&counters.advisory_tick_count);
+    counters.latest_advisory_diff_us.store(value, .monotonic);
+
+    var min_current = counters.min_advisory_diff_us.load(.monotonic);
+    while (value < min_current) {
+        min_current = counters.min_advisory_diff_us.cmpxchgWeak(min_current, value, .monotonic, .monotonic) orelse break;
+    }
+
+    var max_current = counters.max_advisory_diff_us.load(.monotonic);
+    while (value > max_current) {
+        max_current = counters.max_advisory_diff_us.cmpxchgWeak(max_current, value, .monotonic, .monotonic) orelse break;
+    }
+}
+
+fn monotonicNanoseconds() ?u64 {
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return null;
+        if (ts.sec < 0 or ts.nsec < 0) return null;
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+    return null;
+}
 
 fn computeProcessWait(advisory_diff_us: ?c_int, has_unsent: bool) ProcessWait {
     if (advisory_diff_us) |diff| {
@@ -869,6 +970,9 @@ pub const QuicEngine = struct {
     /// Owned by the engine so it outlives the stack frames that spawn the loops.
     background: Io.Group,
 
+    /// Behavior-preserving instrumentation for QUIC runtime diagnostics.
+    debug: DebugCounters,
+
     // lsquic callback vtables (must be stable pointers)
     stream_if: lsquic.lsquic_stream_if,
 
@@ -924,6 +1028,7 @@ pub const QuicEngine = struct {
         self.processing = .init(false);
         self.pending_server_conn = null;
         self.background = .init;
+        self.debug = .{};
 
         self.conn_queue = Io.Queue(ConnEvent).init(&self.conn_queue_buf);
 
@@ -1066,6 +1171,44 @@ pub const QuicEngine = struct {
         ssl.SSL_CTX_free(self.ssl_ctx);
         self.cert_verify_ctx.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Return a coherent-enough snapshot of QUIC diagnostic counters.
+    /// Counters are observational only: reading them does not alter engine behavior.
+    pub fn debugStatsSnapshot(self: *QuicEngine) QuicDebugStats {
+        const advisory_count = self.debug.advisory_tick_count.load(.monotonic);
+        const latest_advisory_diff_us: ?i64 = if (advisory_count == 0) null else self.debug.latest_advisory_diff_us.load(.monotonic);
+        const min_advisory_raw = self.debug.min_advisory_diff_us.load(.monotonic);
+        const max_advisory_raw = self.debug.max_advisory_diff_us.load(.monotonic);
+        return .{
+            .timer_immediate_count = self.debug.timer_immediate_count.load(.monotonic),
+            .timer_timeout_count = self.debug.timer_timeout_count.load(.monotonic),
+            .timer_indefinite_count = self.debug.timer_indefinite_count.load(.monotonic),
+            .current_consecutive_immediate_ticks = self.debug.current_consecutive_immediate_ticks.load(.monotonic),
+            .max_consecutive_immediate_ticks = self.debug.max_consecutive_immediate_ticks.load(.monotonic),
+            .advisory_tick_count = advisory_count,
+            .latest_advisory_diff_us = latest_advisory_diff_us,
+            .min_advisory_diff_us = if (advisory_count == 0 or min_advisory_raw == std.math.maxInt(i64)) null else min_advisory_raw,
+            .max_advisory_diff_us = if (advisory_count == 0 or max_advisory_raw == std.math.minInt(i64)) null else max_advisory_raw,
+            .process_engine_count = self.debug.process_engine_count.load(.monotonic),
+            .process_engine_reentrant_skip_count = self.debug.process_engine_reentrant_skip_count.load(.monotonic),
+            .process_engine_total_ns = self.debug.process_engine_total_ns.load(.monotonic),
+            .process_engine_max_ns = self.debug.process_engine_max_ns.load(.monotonic),
+            .on_read_count = self.debug.on_read_count.load(.monotonic),
+            .on_read_bytes = self.debug.on_read_bytes.load(.monotonic),
+            .on_read_would_block_count = self.debug.on_read_would_block_count.load(.monotonic),
+            .on_read_zero_before_data_count = self.debug.on_read_zero_before_data_count.load(.monotonic),
+            .on_read_eof_count = self.debug.on_read_eof_count.load(.monotonic),
+            .read_queue_full_count = self.debug.read_queue_full_count.load(.monotonic),
+            .read_queue_closed_count = self.debug.read_queue_closed_count.load(.monotonic),
+            .accept_queue_full_count = self.debug.accept_queue_full_count.load(.monotonic),
+            .accept_queue_closed_count = self.debug.accept_queue_closed_count.load(.monotonic),
+            .packets_out_call_count = self.debug.packets_out_call_count.load(.monotonic),
+            .packets_out_sent_count = self.debug.packets_out_sent_count.load(.monotonic),
+            .packets_out_eagain_count = self.debug.packets_out_eagain_count.load(.monotonic),
+            .packets_out_error_count = self.debug.packets_out_error_count.load(.monotonic),
+            .has_unsent_retry_count = self.debug.has_unsent_retry_count.load(.monotonic),
+        };
     }
 
     fn drainConnQueue(self: *QuicEngine) void {
@@ -1265,14 +1408,28 @@ pub const QuicEngine = struct {
             const advisory_diff = if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) diff else null;
             const has_unsent = self.has_unsent;
             self.unlockLsquic();
-            switch (computeProcessWait(advisory_diff, has_unsent)) {
-                .immediate => {},
-                .indefinite => self.process_wake.wait(io) catch |err| switch (err) {
-                    error.Canceled => return,
+            const wait = computeProcessWait(advisory_diff, has_unsent);
+            if (advisory_diff) |advisory| updateAdvisoryStats(&self.debug, advisory);
+            switch (wait) {
+                .immediate => {
+                    counterInc(&self.debug.timer_immediate_count);
+                    const consecutive = self.debug.current_consecutive_immediate_ticks.fetchAdd(1, .monotonic) + 1;
+                    updateMax(&self.debug.max_consecutive_immediate_ticks, consecutive);
                 },
-                .timeout_us => |us| self.process_wake.waitTimeout(io, timeoutFromMicroseconds(us)) catch |err| switch (err) {
-                    error.Timeout => {},
-                    error.Canceled => return,
+                .indefinite => {
+                    counterInc(&self.debug.timer_indefinite_count);
+                    self.debug.current_consecutive_immediate_ticks.store(0, .monotonic);
+                    self.process_wake.wait(io) catch |err| switch (err) {
+                        error.Canceled => return,
+                    };
+                },
+                .timeout_us => |us| {
+                    counterInc(&self.debug.timer_timeout_count);
+                    self.debug.current_consecutive_immediate_ticks.store(0, .monotonic);
+                    self.process_wake.waitTimeout(io, timeoutFromMicroseconds(us)) catch |err| switch (err) {
+                        error.Timeout => {},
+                        error.Canceled => return,
+                    };
                 },
             }
 
@@ -1298,14 +1455,31 @@ pub const QuicEngine = struct {
     fn processEngine(self: *QuicEngine) void {
         // Guard against re-entrancy: lsquic asserts that process_conns is
         // not called while already inside process_conns.
-        if (self.processing.swap(true, .acq_rel)) return;
-        defer self.processing.store(false, .release);
+        if (self.processing.swap(true, .acq_rel)) {
+            counterInc(&self.debug.process_engine_reentrant_skip_count);
+            return;
+        }
+        const start_ns = monotonicNanoseconds();
+        defer {
+            if (start_ns) |start| {
+                if (monotonicNanoseconds()) |end| {
+                    if (end >= start) {
+                        const duration_ns = end - start;
+                        counterAdd(&self.debug.process_engine_total_ns, duration_ns);
+                        updateMax(&self.debug.process_engine_max_ns, duration_ns);
+                    }
+                }
+            }
+            self.processing.store(false, .release);
+        }
+        counterInc(&self.debug.process_engine_count);
         {
             self.lockLsquic();
             defer self.unlockLsquic();
             // Retry unsent packets first (socket may now be writable)
             if (self.has_unsent) {
                 self.has_unsent = false;
+                counterInc(&self.debug.has_unsent_retry_count);
                 lsquic.lsquic_engine_send_unsent_packets(self.engine);
             }
             lsquic.lsquic_engine_process_conns(self.engine);
@@ -1317,12 +1491,14 @@ pub const QuicEngine = struct {
             self.pending_server_conn = null;
             log.debug("processEngine: pushing pending server conn to accept queue", .{});
             const queued = tryQueueOneUncancelable(ConnEvent, &self.conn_queue, self.io, .{ .conn = conn }) catch |err| {
+                counterInc(&self.debug.accept_queue_closed_count);
                 log.warn("processEngine: accept queue closed while handing off server conn: {}", .{err});
                 conn.close(self.io);
                 conn.deinit();
                 return;
             };
             if (!queued) {
+                counterInc(&self.debug.accept_queue_full_count);
                 log.warn("processEngine: accept queue full, closing server conn", .{});
                 conn.close(self.io);
                 conn.deinit();
@@ -1555,11 +1731,13 @@ pub const QuicEngine = struct {
             // our reader calls read(), causing UnexpectedEof.
             _ = lsquic.lsquic_stream_wantread(s, 1);
             const queued = tryQueueOneUncancelable(StreamEvent, &conn.stream_queue, engine.io, .{ .stream = stream }) catch |err| {
+                counterInc(&engine.debug.accept_queue_closed_count);
                 log.warn("onNewStream: inbound stream queue closed: {}", .{err});
                 stream.destroyRejectedNoLock();
                 return null;
             };
             if (!queued) {
+                counterInc(&engine.debug.accept_queue_full_count);
                 log.warn("onNewStream: dropping inbound stream because accept queue is full", .{});
                 stream.destroyRejectedNoLock();
                 return null;
@@ -1577,9 +1755,11 @@ pub const QuicEngine = struct {
         defer stream.releaseRef();
 
         const stream_id = lsquic.lsquic_stream_id(s);
+        counterInc(&stream.conn.engine.debug.on_read_count);
         var buf: [4096]u8 = undefined;
         const n = lsquic.lsquic_stream_read(s, &buf, buf.len);
         if (n < 0) {
+            counterInc(&stream.conn.engine.debug.on_read_would_block_count);
             // No bytes are currently available. Drop wantread until the
             // consumer calls read() again so we do not spin callbacks.
             _ = lsquic.lsquic_stream_wantread(s, 0);
@@ -1588,6 +1768,7 @@ pub const QuicEngine = struct {
         }
         if (n == 0) {
             if (!stream.has_received_data) {
+                counterInc(&stream.conn.engine.debug.on_read_zero_before_data_count);
                 // No data yet — STREAM frames not decoded in this tick.
                 // With es_rw_once=1, lsquic won't re-call us this tick.
                 // Leave wantread armed; next process_conns tick will retry.
@@ -1598,6 +1779,7 @@ pub const QuicEngine = struct {
                 return;
             }
             // Genuine EOF — peer sent FIN after sending data.
+            counterInc(&stream.conn.engine.debug.on_read_eof_count);
             log.debug("onRead: stream {d} EOF", .{stream_id});
             _ = lsquic.lsquic_stream_wantread(s, 0);
             stream.read_queue.close(stream.io);
@@ -1605,6 +1787,7 @@ pub const QuicEngine = struct {
         }
 
         const len: usize = @intCast(n);
+        counterAdd(&stream.conn.engine.debug.on_read_bytes, len);
         log.debug("onRead: stream {d} got {d} bytes", .{ stream_id, len });
         stream.has_received_data = true;
         stream.spurious_read_count = 0;
@@ -1620,6 +1803,7 @@ pub const QuicEngine = struct {
             .data = owned,
             .owned_buf = owned,
         }) catch {
+            counterInc(&stream.conn.engine.debug.read_queue_closed_count);
             stream.allocator.free(owned);
             log.warn("onRead: read queue closed, closing stream", .{});
             stream.closeNoLock();
@@ -1628,6 +1812,7 @@ pub const QuicEngine = struct {
             return;
         };
         if (!queued) {
+            counterInc(&stream.conn.engine.debug.read_queue_full_count);
             stream.allocator.free(owned);
             log.warn("onRead: read queue full, closing stream", .{});
             stream.closeNoLock();
@@ -1700,6 +1885,7 @@ pub const QuicEngine = struct {
     ) callconv(.c) c_int {
         log.debug("packetsOut called, count={}", .{count});
         const engine: *QuicEngine = @ptrCast(@alignCast(packets_out_ctx));
+        counterInc(&engine.debug.packets_out_call_count);
 
         var sent: c_int = 0;
         var i: c_uint = 0;
@@ -1728,6 +1914,7 @@ pub const QuicEngine = struct {
             if (rc < 0) {
                 const e: std.c.E = @enumFromInt(std.c._errno().*);
                 if (e == .AGAIN or e == .INTR) {
+                    counterInc(&engine.debug.packets_out_eagain_count);
                     // Non-blocking socket would block or interrupted.
                     // Flag unsent packets so the timer loop can retry
                     // via lsquic_engine_send_unsent_packets().
@@ -1735,8 +1922,10 @@ pub const QuicEngine = struct {
                     engine.requestProcessWake();
                     return sent;
                 }
+                counterInc(&engine.debug.packets_out_error_count);
                 return -1;
             }
+            counterInc(&engine.debug.packets_out_sent_count);
             sent += 1;
         }
         return sent;

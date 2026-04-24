@@ -1061,6 +1061,54 @@ test "QUIC multiple concurrent streams" {
     }
 }
 
+test "QUIC exposes timer and callback debug counters under stream load" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ctx = TestContext.initPair(allocator, io) catch |err| {
+        std.log.warn("TestContext init failed: {}", .{err});
+        return;
+    };
+    defer ctx.deinit(io);
+
+    const stream_count = 8;
+    const payload = "eth-libp2p-z quic debug counter stress payload";
+    var client_streams: [stream_count]*engine_mod.QuicStream = undefined;
+    var server_streams: [stream_count]*engine_mod.QuicStream = undefined;
+
+    for (0..stream_count) |i| {
+        client_streams[i] = try ctx.client_conn.openStream(io);
+        const written = try client_streams[i].write(io, payload);
+        try std.testing.expectEqual(payload.len, written);
+    }
+    defer for (0..stream_count) |i| {
+        client_streams[i].close(io);
+        client_streams[i].deinit();
+    };
+
+    for (0..stream_count) |i| {
+        server_streams[i] = try ctx.server_conn.acceptStream(io);
+        var buf: [payload.len]u8 = undefined;
+        const read_len = try server_streams[i].read(io, &buf);
+        try std.testing.expectEqual(payload.len, read_len);
+        try std.testing.expectEqualSlices(u8, payload, buf[0..read_len]);
+    }
+    defer for (0..stream_count) |i| {
+        server_streams[i].close(io);
+        server_streams[i].deinit();
+    };
+
+    const server_stats = ctx.server_eng.debugStatsSnapshot();
+    const client_stats = ctx.client_eng.debugStatsSnapshot();
+
+    try std.testing.expect(server_stats.process_engine_count > 0);
+    try std.testing.expect(client_stats.process_engine_count > 0);
+    try std.testing.expect(server_stats.on_read_count >= stream_count);
+    try std.testing.expect(client_stats.packets_out_sent_count > 0);
+    try std.testing.expect(server_stats.timer_immediate_count + server_stats.timer_timeout_count + server_stats.timer_indefinite_count > 0);
+    try std.testing.expect(server_stats.max_consecutive_immediate_ticks < 1000);
+}
+
 test "QUIC bidirectional peer ID verification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

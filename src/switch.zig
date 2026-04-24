@@ -8,7 +8,82 @@ const protocol_mod = @import("protocol/protocol.zig");
 const multistream = @import("protocol/multistream.zig");
 const engine_mod = @import("transport/quic/engine.zig");
 const QuicEngine = engine_mod.QuicEngine;
+pub const QuicDebugStats = engine_mod.QuicDebugStats;
 const quic_mod = @import("transport/quic/quic.zig");
+
+fn zeroQuicDebugStats() QuicDebugStats {
+    return .{
+        .timer_immediate_count = 0,
+        .timer_timeout_count = 0,
+        .timer_indefinite_count = 0,
+        .current_consecutive_immediate_ticks = 0,
+        .max_consecutive_immediate_ticks = 0,
+        .advisory_tick_count = 0,
+        .latest_advisory_diff_us = null,
+        .min_advisory_diff_us = null,
+        .max_advisory_diff_us = null,
+        .process_engine_count = 0,
+        .process_engine_reentrant_skip_count = 0,
+        .process_engine_total_ns = 0,
+        .process_engine_max_ns = 0,
+        .on_read_count = 0,
+        .on_read_bytes = 0,
+        .on_read_would_block_count = 0,
+        .on_read_zero_before_data_count = 0,
+        .on_read_eof_count = 0,
+        .read_queue_full_count = 0,
+        .read_queue_closed_count = 0,
+        .accept_queue_full_count = 0,
+        .accept_queue_closed_count = 0,
+        .packets_out_call_count = 0,
+        .packets_out_sent_count = 0,
+        .packets_out_eagain_count = 0,
+        .packets_out_error_count = 0,
+        .has_unsent_retry_count = 0,
+    };
+}
+
+fn addOptionalMin(dest: *?i64, value: ?i64) void {
+    if (value) |v| {
+        dest.* = if (dest.*) |current| @min(current, v) else v;
+    }
+}
+
+fn addOptionalMax(dest: *?i64, value: ?i64) void {
+    if (value) |v| {
+        dest.* = if (dest.*) |current| @max(current, v) else v;
+    }
+}
+
+fn addQuicDebugStats(dest: *QuicDebugStats, src: QuicDebugStats) void {
+    dest.timer_immediate_count += src.timer_immediate_count;
+    dest.timer_timeout_count += src.timer_timeout_count;
+    dest.timer_indefinite_count += src.timer_indefinite_count;
+    dest.current_consecutive_immediate_ticks += src.current_consecutive_immediate_ticks;
+    dest.max_consecutive_immediate_ticks = @max(dest.max_consecutive_immediate_ticks, src.max_consecutive_immediate_ticks);
+    dest.advisory_tick_count += src.advisory_tick_count;
+    if (src.latest_advisory_diff_us != null) dest.latest_advisory_diff_us = src.latest_advisory_diff_us;
+    addOptionalMin(&dest.min_advisory_diff_us, src.min_advisory_diff_us);
+    addOptionalMax(&dest.max_advisory_diff_us, src.max_advisory_diff_us);
+    dest.process_engine_count += src.process_engine_count;
+    dest.process_engine_reentrant_skip_count += src.process_engine_reentrant_skip_count;
+    dest.process_engine_total_ns += src.process_engine_total_ns;
+    dest.process_engine_max_ns = @max(dest.process_engine_max_ns, src.process_engine_max_ns);
+    dest.on_read_count += src.on_read_count;
+    dest.on_read_bytes += src.on_read_bytes;
+    dest.on_read_would_block_count += src.on_read_would_block_count;
+    dest.on_read_zero_before_data_count += src.on_read_zero_before_data_count;
+    dest.on_read_eof_count += src.on_read_eof_count;
+    dest.read_queue_full_count += src.read_queue_full_count;
+    dest.read_queue_closed_count += src.read_queue_closed_count;
+    dest.accept_queue_full_count += src.accept_queue_full_count;
+    dest.accept_queue_closed_count += src.accept_queue_closed_count;
+    dest.packets_out_call_count += src.packets_out_call_count;
+    dest.packets_out_sent_count += src.packets_out_sent_count;
+    dest.packets_out_eagain_count += src.packets_out_eagain_count;
+    dest.packets_out_error_count += src.packets_out_error_count;
+    dest.has_unsent_retry_count += src.has_unsent_retry_count;
+}
 const identity = @import("identity.zig");
 const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
@@ -141,6 +216,20 @@ pub fn Switch(comptime config: SwitchConfig) type {
         pub fn listenAddrs(self: *const Self) []const net.IpAddress {
             const eng = self.server_engine orelse return &.{};
             return eng.localAddrs();
+        }
+
+        /// Returns a behavior-preserving snapshot of QUIC debug counters across
+        /// the server and client engines owned by this switch. Missing engines
+        /// contribute zero-valued counters.
+        pub fn quicDebugStatsSnapshot(self: *Self) QuicDebugStats {
+            var snapshot: QuicDebugStats = zeroQuicDebugStats();
+            if (self.server_engine) |eng| {
+                addQuicDebugStats(&snapshot, eng.debugStatsSnapshot());
+            }
+            if (self.client_engine) |eng| {
+                addQuicDebugStats(&snapshot, eng.debugStatsSnapshot());
+            }
+            return snapshot;
         }
 
         fn lockConnections(self: *Self, io: Io) void {
