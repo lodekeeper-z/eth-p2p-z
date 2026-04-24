@@ -190,6 +190,61 @@ fn shouldCloseAfterZeroBeforeDataTick(spurious_read_count: u32) bool {
     return spurious_read_count >= max_zero_before_data_read_ticks;
 }
 
+const ZeroReadCloseStage = enum {
+    zero_before_data,
+    before_defensive_close,
+    on_stream_close_empty,
+    on_stream_close_drained,
+};
+
+const ZeroReadAttributionInput = struct {
+    stream_id: u64,
+    engine_is_server: bool,
+    has_received_data: bool,
+    spurious_read_count: u32,
+    closed: bool,
+    read_closed: bool,
+    write_closed: bool,
+    drain_total: ?usize,
+};
+
+const ZeroReadAttribution = struct {
+    stream_id: u64,
+    stream_server_initiated: bool,
+    locally_initiated: bool,
+    has_received_data: bool,
+    spurious_read_count: u32,
+    closed: bool,
+    read_closed: bool,
+    write_closed: bool,
+    drain_total: ?usize,
+    stage: ZeroReadCloseStage,
+};
+
+fn zeroReadAttributionSnapshot(input: ZeroReadAttributionInput) ZeroReadAttribution {
+    const stream_server_initiated = (input.stream_id % 4) == 1;
+    const locally_initiated = input.engine_is_server == stream_server_initiated;
+    const stage: ZeroReadCloseStage = if (input.drain_total) |drained|
+        if (drained == 0) .on_stream_close_empty else .on_stream_close_drained
+    else if (shouldCloseAfterZeroBeforeDataTick(input.spurious_read_count))
+        .before_defensive_close
+    else
+        .zero_before_data;
+
+    return .{
+        .stream_id = input.stream_id,
+        .stream_server_initiated = stream_server_initiated,
+        .locally_initiated = locally_initiated,
+        .has_received_data = input.has_received_data,
+        .spurious_read_count = input.spurious_read_count,
+        .closed = input.closed,
+        .read_closed = input.read_closed,
+        .write_closed = input.write_closed,
+        .drain_total = input.drain_total,
+        .stage = stage,
+    };
+}
+
 test "inbound stream creation does not arm wantread before application read" {
     try std.testing.expect(!shouldArmWantReadOnInboundStreamCreate());
 }
@@ -198,6 +253,37 @@ test "repeated zero-byte reads before payload close the unreadable stream" {
     try std.testing.expect(!shouldCloseAfterZeroBeforeDataTick(1));
     try std.testing.expect(!shouldCloseAfterZeroBeforeDataTick(max_zero_before_data_read_ticks - 1));
     try std.testing.expect(shouldCloseAfterZeroBeforeDataTick(max_zero_before_data_read_ticks));
+}
+
+test "zero-read attribution classifies stream direction and closure reason" {
+    const before_close = zeroReadAttributionSnapshot(.{
+        .stream_id = 8,
+        .engine_is_server = false,
+        .has_received_data = false,
+        .spurious_read_count = max_zero_before_data_read_ticks,
+        .closed = false,
+        .read_closed = false,
+        .write_closed = false,
+        .drain_total = null,
+    });
+    try std.testing.expectEqual(@as(u64, 8), before_close.stream_id);
+    try std.testing.expect(before_close.locally_initiated);
+    try std.testing.expect(!before_close.stream_server_initiated);
+    try std.testing.expectEqual(ZeroReadCloseStage.before_defensive_close, before_close.stage);
+
+    const on_close = zeroReadAttributionSnapshot(.{
+        .stream_id = 9,
+        .engine_is_server = false,
+        .has_received_data = false,
+        .spurious_read_count = max_zero_before_data_read_ticks,
+        .closed = true,
+        .read_closed = true,
+        .write_closed = true,
+        .drain_total = 0,
+    });
+    try std.testing.expect(!on_close.locally_initiated);
+    try std.testing.expect(on_close.stream_server_initiated);
+    try std.testing.expectEqual(ZeroReadCloseStage.on_stream_close_empty, on_close.stage);
 }
 
 fn timeoutFromMicroseconds(us: i64) Io.Timeout {
@@ -1801,9 +1887,28 @@ pub const QuicEngine = struct {
                 // keep requesting immediate process_conns ticks indefinitely.
                 stream.spurious_read_count += 1;
                 if (shouldCloseAfterZeroBeforeDataTick(stream.spurious_read_count)) {
-                    log.warn("onRead: stream {d} produced {d} zero-byte reads before data; closing to avoid QUIC read hot loop", .{
-                        stream_id,
-                        stream.spurious_read_count,
+                    const attribution = zeroReadAttributionSnapshot(.{
+                        .stream_id = stream_id,
+                        .engine_is_server = stream.conn.engine.is_server,
+                        .has_received_data = stream.has_received_data,
+                        .spurious_read_count = stream.spurious_read_count,
+                        .closed = stream.closed,
+                        .read_closed = stream.read_closed,
+                        .write_closed = stream.write_closed,
+                        .drain_total = null,
+                    });
+                    log.warn("onRead: zero-read-attribution stage={s} stream_id={d} locally_initiated={} stream_server_initiated={} engine_is_server={} has_received_data={} spurious_reads={} closed={} read_closed={} write_closed={} peer_known={} action=defensive_close", .{
+                        @tagName(attribution.stage),
+                        attribution.stream_id,
+                        attribution.locally_initiated,
+                        attribution.stream_server_initiated,
+                        stream.conn.engine.is_server,
+                        attribution.has_received_data,
+                        attribution.spurious_read_count,
+                        attribution.closed,
+                        attribution.read_closed,
+                        attribution.write_closed,
+                        stream.conn.peer_id != null,
                     });
                     _ = lsquic.lsquic_stream_wantread(s, 0);
                     stream.closeNoLock();
@@ -1903,6 +2008,32 @@ pub const QuicEngine = struct {
         }
         if (drain_total > 0) {
             log.info("onStreamClose: drained {d} bytes from stream", .{drain_total});
+        }
+        if (!stream.has_received_data and stream.spurious_read_count > 0) {
+            const attribution = zeroReadAttributionSnapshot(.{
+                .stream_id = lsquic.lsquic_stream_id(s),
+                .engine_is_server = stream.conn.engine.is_server,
+                .has_received_data = stream.has_received_data,
+                .spurious_read_count = stream.spurious_read_count,
+                .closed = stream.closed,
+                .read_closed = stream.read_closed,
+                .write_closed = stream.write_closed,
+                .drain_total = drain_total,
+            });
+            log.warn("onStreamClose: zero-read-attribution stage={s} stream_id={d} locally_initiated={} stream_server_initiated={} engine_is_server={} has_received_data={} spurious_reads={} closed={} read_closed={} write_closed={} drain_total={} peer_known={} action=close_callback", .{
+                @tagName(attribution.stage),
+                attribution.stream_id,
+                attribution.locally_initiated,
+                attribution.stream_server_initiated,
+                stream.conn.engine.is_server,
+                attribution.has_received_data,
+                attribution.spurious_read_count,
+                attribution.closed,
+                attribution.read_closed,
+                attribution.write_closed,
+                drain_total,
+                stream.conn.peer_id != null,
+            });
         }
 
         stream.lsquic_stream = null;
