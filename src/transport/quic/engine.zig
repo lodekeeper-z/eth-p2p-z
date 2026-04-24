@@ -54,6 +54,7 @@ const unsent_retry_interval_ms: i64 = 10;
 /// Large req/resp bodies can burst many QUIC read callbacks before the
 /// application stream reader is rescheduled.
 const stream_read_queue_capacity: usize = 8192;
+const max_zero_before_data_read_ticks: u32 = 3;
 
 pub const QuicDebugStats = struct {
     timer_immediate_count: u64 = 0,
@@ -175,6 +176,28 @@ fn computeProcessWait(advisory_diff_us: ?c_int, has_unsent: bool) ProcessWait {
         return .{ .timeout_us = unsent_retry_interval_ms * std.time.us_per_ms };
     }
     return .indefinite;
+}
+
+fn shouldArmWantReadOnInboundStreamCreate() bool {
+    // Inbound stream creation only establishes the stream object and hands it to
+    // the application. The application read path arms wantread when a consumer is
+    // actually waiting. Eagerly arming here can make lsquic repeatedly invoke
+    // onRead before STREAM frames are decoded, producing a zero-byte hot loop.
+    return false;
+}
+
+fn shouldCloseAfterZeroBeforeDataTick(spurious_read_count: u32) bool {
+    return spurious_read_count >= max_zero_before_data_read_ticks;
+}
+
+test "inbound stream creation does not arm wantread before application read" {
+    try std.testing.expect(!shouldArmWantReadOnInboundStreamCreate());
+}
+
+test "repeated zero-byte reads before payload close the unreadable stream" {
+    try std.testing.expect(!shouldCloseAfterZeroBeforeDataTick(1));
+    try std.testing.expect(!shouldCloseAfterZeroBeforeDataTick(max_zero_before_data_read_ticks - 1));
+    try std.testing.expect(shouldCloseAfterZeroBeforeDataTick(max_zero_before_data_read_ticks));
 }
 
 fn timeoutFromMicroseconds(us: i64) Io.Timeout {
@@ -1725,11 +1748,13 @@ pub const QuicEngine = struct {
                 return null;
             }
         } else {
-            // Arm wantread immediately for inbound streams so lsquic
-            // delivers data via onRead before the stream is closed.
-            // Without this, Lighthouse can send data + half-close before
-            // our reader calls read(), causing UnexpectedEof.
-            _ = lsquic.lsquic_stream_wantread(s, 1);
+            // Do not arm wantread until the application calls read(). Eagerly
+            // arming here can make lsquic call onRead before STREAM frames have
+            // been decoded, producing repeated zero-byte callbacks and an
+            // immediate advisory timer hot loop.
+            if (shouldArmWantReadOnInboundStreamCreate()) {
+                _ = lsquic.lsquic_stream_wantread(s, 1);
+            }
             const queued = tryQueueOneUncancelable(StreamEvent, &conn.stream_queue, engine.io, .{ .stream = stream }) catch |err| {
                 counterInc(&engine.debug.accept_queue_closed_count);
                 log.warn("onNewStream: inbound stream queue closed: {}", .{err});
@@ -1771,8 +1796,19 @@ pub const QuicEngine = struct {
                 counterInc(&stream.conn.engine.debug.on_read_zero_before_data_count);
                 // No data yet — STREAM frames not decoded in this tick.
                 // With es_rw_once=1, lsquic won't re-call us this tick.
-                // Leave wantread armed; next process_conns tick will retry.
+                // Tolerate a few such ticks, but close the stream if it keeps
+                // reporting zero bytes before any data; otherwise lsquic can
+                // keep requesting immediate process_conns ticks indefinitely.
                 stream.spurious_read_count += 1;
+                if (shouldCloseAfterZeroBeforeDataTick(stream.spurious_read_count)) {
+                    log.warn("onRead: stream {d} produced {d} zero-byte reads before data; closing to avoid QUIC read hot loop", .{
+                        stream_id,
+                        stream.spurious_read_count,
+                    });
+                    _ = lsquic.lsquic_stream_wantread(s, 0);
+                    stream.closeNoLock();
+                    return;
+                }
                 if (stream.spurious_read_count <= 3) {
                     log.debug("onRead: stream {d} no data yet (tick {d})", .{ stream_id, stream.spurious_read_count });
                 }
