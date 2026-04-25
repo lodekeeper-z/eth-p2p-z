@@ -65,8 +65,6 @@ pub const Service = struct {
     tracked_subscriptions: std.StringHashMap(void),
     /// Serializes router and stream state across concurrent service fibers.
     state_mu: Io.Mutex,
-    /// Borrowed only while running synchronous router callbacks that may write.
-    active_io: ?Io,
 
     /// An AnyStream with heap-allocated backing that can be freed.
     const OwnedStream = struct {
@@ -194,7 +192,6 @@ pub const Service = struct {
             .outbound_streams = std.StringHashMap(*InstalledPeerStream).init(allocator),
             .tracked_subscriptions = std.StringHashMap(void).init(allocator),
             .state_mu = .init,
-            .active_io = null,
         };
         self.router = RouterType.init(allocator, gs_config, self) catch |e| {
             allocator.destroy(self);
@@ -209,15 +206,6 @@ pub const Service = struct {
 
     fn unlock(self: *Self, io: Io) void {
         self.state_mu.unlock(io);
-    }
-
-    fn activateIo(self: *Self, io: Io) void {
-        std.debug.assert(self.active_io == null);
-        self.active_io = io;
-    }
-
-    fn deactivateIo(self: *Self) void {
-        self.active_io = null;
     }
 
     /// Release all resources owned by this Service.
@@ -269,8 +257,6 @@ pub const Service = struct {
         {
             self.lock(io);
             defer self.unlock(io);
-            self.activateIo(io);
-            defer self.deactivateIo();
 
             self.router.addPeer(peer_id) catch {};
             if (try self.installPeerStream(peer_id, stream)) |installed| {
@@ -281,6 +267,7 @@ pub const Service = struct {
             }
             self.flushPendingSendsForPeer(io, peer_id);
             self.sendSubscriptionAnnouncement(peer_id);
+            self.flushPendingSendsForPeer(io, peer_id);
             log.info("gossipsub: announced {d} subscriptions to inbound peer", .{self.tracked_subscriptions.count()});
         }
 
@@ -309,11 +296,9 @@ pub const Service = struct {
                 defer self.allocator.free(frame);
                 log.debug("gossipsub: decoded frame of {d} bytes", .{frame.len});
                 self.lock(io);
-                self.activateIo(io);
                 self.router.handleRpc(peer_id, frame) catch |err| {
                     log.warn("gossipsub: handleRpc error: {}", .{err});
                 };
-                self.deactivateIo();
                 self.unlock(io);
             }
         }
@@ -321,9 +306,9 @@ pub const Service = struct {
 
     /// Handle an outbound gossipsub stream.
     ///
-    /// Stores the stream as an AnyStream keyed by peer ID so that sendRpc
-    /// can write directly to it. Announces current subscriptions to the
-    /// new peer.
+    /// Stores the stream as an AnyStream keyed by peer ID. Router callbacks
+    /// enqueue outbound RPCs through sendRpc; connection setup explicitly
+    /// flushes queued data to the newly installed peer stream.
     pub fn handleOutbound(self: *Self, io: Io, stream: anytype, ctx: anytype) !void {
         const peer_id: []const u8 = if (@hasField(@TypeOf(ctx), "peer_id"))
             (ctx.peer_id orelse return)
@@ -332,8 +317,6 @@ pub const Service = struct {
 
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
 
         if ((try self.installPeerStream(peer_id, stream)) == null) {
             log.info("gossipsub: keeping existing peer stream for duplicate outbound stream", .{});
@@ -342,6 +325,7 @@ pub const Service = struct {
         self.flushPendingSendsForPeer(io, peer_id);
         self.router.addPeer(peer_id) catch {};
         self.sendSubscriptionAnnouncement(peer_id);
+        self.flushPendingSendsForPeer(io, peer_id);
     }
 
     /// Send a subscription announcement to a peer for all tracked subscriptions.
@@ -377,24 +361,10 @@ pub const Service = struct {
     // ---------------------------------------------------------------
 
     /// Send raw RPC bytes to a peer. Called by the Router.
-    /// Tries direct write to outbound stream first; falls back to
-    /// pending-sends queue for unit tests and unconnected peers.
+    /// Enqueues outbound RPC data for later flushing by the integration layer.
+    /// This keeps router callbacks (including validation-result reporting) from
+    /// blocking on QUIC stream write readiness while holding gossipsub state.
     pub fn sendRpc(self: *Self, peer: []const u8, data: []const u8) bool {
-        // Try direct write to outbound stream
-        if (self.outbound_streams.get(peer)) |managed_stream| {
-            if (self.active_io) |io| {
-                managed_stream.retain();
-                defer managed_stream.release(self.allocator);
-                var total: usize = 0;
-                while (total < data.len) {
-                    const n = managed_stream.write(io, data[total..]) catch return false;
-                    if (n == 0) return false;
-                    total += n;
-                }
-                return true;
-            }
-        }
-        // Fallback: enqueue for external draining (unit tests, unconnected peers)
         const peer_copy = self.allocator.dupe(u8, peer) catch return false;
         const data_copy = self.allocator.dupe(u8, data) catch {
             self.allocator.free(peer_copy);
@@ -461,6 +431,13 @@ pub const Service = struct {
         }
     }
 
+    fn flushPendingSends(self: *Self, io: Io) void {
+        var peer_iter = self.outbound_streams.keyIterator();
+        while (peer_iter.next()) |peer_id| {
+            self.flushPendingSendsForPeer(io, peer_id.*);
+        }
+    }
+
     fn dropPendingSendsForPeer(self: *Self, peer_id: []const u8) void {
         var i: usize = 0;
         while (i < self.pending_sends.items.len) {
@@ -505,8 +482,6 @@ pub const Service = struct {
     pub fn subscribe(self: *Self, io: Io, topic: []const u8) !void {
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
         try self.router.subscribe(topic);
         if (!self.tracked_subscriptions.contains(topic)) {
             const topic_copy = try self.allocator.dupe(u8, topic);
@@ -520,8 +495,6 @@ pub const Service = struct {
     pub fn unsubscribe(self: *Self, io: Io, topic: []const u8) !void {
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
         try self.router.unsubscribe(topic);
         if (self.tracked_subscriptions.fetchRemove(topic)) |kv| {
             self.allocator.free(kv.key);
@@ -533,8 +506,6 @@ pub const Service = struct {
     pub fn publish(self: *Self, io: Io, topic: []const u8, data: []const u8) !u32 {
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
         return try self.router.publish(topic, data);
     }
 
@@ -542,8 +513,6 @@ pub const Service = struct {
     pub fn addPeer(self: *Self, io: Io, peer_id: []const u8) !void {
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
         try self.router.addPeer(peer_id);
     }
 
@@ -565,9 +534,8 @@ pub const Service = struct {
     pub fn heartbeat(self: *Self, io: Io) !void {
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
         try self.router.heartbeat();
+        self.flushPendingSends(io);
     }
 
     /// Drain accumulated events from the Router.
@@ -588,8 +556,6 @@ pub const Service = struct {
     ) bool {
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
         return self.router.reportValidationResult(msg_id, result);
     }
 
@@ -598,8 +564,6 @@ pub const Service = struct {
     pub fn handleRpc(self: *Self, io: Io, from_peer: []const u8, rpc_bytes: []const u8) !void {
         self.lock(io);
         defer self.unlock(io);
-        self.activateIo(io);
-        defer self.deactivateIo();
         try self.router.handleRpc(from_peer, rpc_bytes);
     }
 
@@ -742,33 +706,51 @@ test "Service sendRpc enforces pending queue limits" {
     try std.testing.expectEqual(@as(usize, 0), svc.pending_send_bytes);
 }
 
-test "Service flushes queued RPCs when a peer stream is installed" {
+const RecordingStream = struct {
+    const Self = @This();
+
+    writes: *std.ArrayList(u8),
+
+    pub fn read(_: *Self, _: Io, _: []u8) !usize {
+        return 0;
+    }
+
+    pub fn write(self: *Self, _: Io, data: []const u8) !usize {
+        try self.writes.appendSlice(std.testing.allocator, data);
+        return data.len;
+    }
+
+    pub fn closeRead(_: *Self, _: Io) void {}
+    pub fn closeWrite(_: *Self, _: Io) void {}
+    pub fn close(_: *Self, _: Io) void {}
+    pub fn deinit(_: *Self) void {}
+
+    pub fn detachOwnedStream(self: *Self) Self {
+        return self.*;
+    }
+};
+
+test "Service sendRpc queues instead of writing from router callbacks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const TestStream = struct {
-        const Self = @This();
+    const svc = try Service.init(allocator, .{});
+    defer svc.deinit(io);
 
-        writes: *std.ArrayList(u8),
+    var writes: std.ArrayList(u8) = .empty;
+    defer writes.deinit(allocator);
+    var stream = RecordingStream{ .writes = &writes };
+    try svc.handleOutbound(io, &stream, .{ .peer_id = @as(?[]const u8, "peer-1") });
 
-        pub fn read(_: *Self, _: Io, _: []u8) !usize {
-            return 0;
-        }
+    try std.testing.expect(svc.sendRpc("peer-1", "queued-rpc"));
 
-        pub fn write(self: *Self, _: Io, data: []const u8) !usize {
-            try self.writes.appendSlice(std.testing.allocator, data);
-            return data.len;
-        }
+    try std.testing.expectEqual(@as(usize, 1), svc.pending_sends.items.len);
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+}
 
-        pub fn closeRead(_: *Self, _: Io) void {}
-        pub fn closeWrite(_: *Self, _: Io) void {}
-        pub fn close(_: *Self, _: Io) void {}
-        pub fn deinit(_: *Self) void {}
-
-        pub fn detachOwnedStream(self: *Self) Self {
-            return self.*;
-        }
-    };
+test "Service flushes queued RPCs when a peer stream is installed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const svc = try Service.init(allocator, .{});
     defer svc.deinit(io);
@@ -778,7 +760,7 @@ test "Service flushes queued RPCs when a peer stream is installed" {
 
     var writes: std.ArrayList(u8) = .empty;
     defer writes.deinit(allocator);
-    var stream = TestStream{ .writes = &writes };
+    var stream = RecordingStream{ .writes = &writes };
 
     try svc.handleOutbound(io, &stream, .{ .peer_id = @as(?[]const u8, "peer-1") });
 
