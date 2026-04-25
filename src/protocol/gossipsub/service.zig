@@ -265,11 +265,10 @@ pub const Service = struct {
             } else {
                 log.info("gossipsub: keeping existing peer stream for duplicate inbound stream", .{});
             }
-            self.flushPendingSendsForPeer(io, peer_id);
             self.sendSubscriptionAnnouncement(peer_id);
-            self.flushPendingSendsForPeer(io, peer_id);
             log.info("gossipsub: announced {d} subscriptions to inbound peer", .{self.tracked_subscriptions.count()});
         }
+        self.flushPendingSendsForPeer(io, peer_id);
 
         var decoder = FrameDecoder.init(self.allocator);
         defer decoder.deinit();
@@ -315,16 +314,17 @@ pub const Service = struct {
         else
             return;
 
-        self.lock(io);
-        defer self.unlock(io);
+        {
+            self.lock(io);
+            defer self.unlock(io);
 
-        if ((try self.installPeerStream(peer_id, stream)) == null) {
-            log.info("gossipsub: keeping existing peer stream for duplicate outbound stream", .{});
+            if ((try self.installPeerStream(peer_id, stream)) == null) {
+                log.info("gossipsub: keeping existing peer stream for duplicate outbound stream", .{});
+            }
+
+            self.router.addPeer(peer_id) catch {};
+            self.sendSubscriptionAnnouncement(peer_id);
         }
-
-        self.flushPendingSendsForPeer(io, peer_id);
-        self.router.addPeer(peer_id) catch {};
-        self.sendSubscriptionAnnouncement(peer_id);
         self.flushPendingSendsForPeer(io, peer_id);
     }
 
@@ -391,50 +391,75 @@ pub const Service = struct {
         return true;
     }
 
-    fn flushPendingSendsForPeer(self: *Self, io: Io, peer_id: []const u8) void {
-        const managed_stream = self.outbound_streams.get(peer_id) orelse return;
+    const PendingWrite = struct {
+        stream: *InstalledPeerStream,
+        peer: []const u8,
+        data: []const u8,
+    };
 
-        managed_stream.retain();
-        defer managed_stream.release(self.allocator);
-
+    fn popNextPendingSendLocked(self: *Self, maybe_peer_id: ?[]const u8) ?PendingWrite {
         var i: usize = 0;
-        while (i < self.pending_sends.items.len) {
+        while (i < self.pending_sends.items.len) : (i += 1) {
             const pending = self.pending_sends.items[i];
-            if (!std.mem.eql(u8, pending.peer, peer_id)) {
-                i += 1;
-                continue;
+            if (maybe_peer_id) |peer_id| {
+                if (!std.mem.eql(u8, pending.peer, peer_id)) continue;
             }
 
-            var total: usize = 0;
-            var ok = true;
-            while (total < pending.data.len) {
-                const n = managed_stream.write(io, pending.data[total..]) catch {
-                    ok = false;
-                    break;
-                };
-                if (n == 0) {
-                    ok = false;
-                    break;
-                }
-                total += n;
-            }
-
-            if (!ok) {
-                i += 1;
-                continue;
-            }
-
+            const managed_stream = self.outbound_streams.get(pending.peer) orelse continue;
+            managed_stream.retain();
             const removed = self.pending_sends.orderedRemove(i);
             self.pending_send_bytes -= removed.peer.len + removed.data.len;
-            self.allocator.free(removed.peer);
-            self.allocator.free(removed.data);
+            return .{
+                .stream = managed_stream,
+                .peer = removed.peer,
+                .data = removed.data,
+            };
+        }
+        return null;
+    }
+
+    fn writePendingSend(self: *Self, io: Io, pending: PendingWrite) void {
+        defer pending.stream.release(self.allocator);
+        defer self.allocator.free(pending.peer);
+        defer self.allocator.free(pending.data);
+
+        var total: usize = 0;
+        while (total < pending.data.len) {
+            const n = pending.stream.write(io, pending.data[total..]) catch |err| {
+                log.debug("gossipsub: dropping queued RPC to peer after stream write error: {}", .{err});
+                return;
+            };
+            if (n == 0) {
+                log.debug("gossipsub: dropping queued RPC to peer after zero-length stream write", .{});
+                return;
+            }
+            total += n;
+        }
+    }
+
+    fn flushPendingSendsForPeer(self: *Self, io: Io, peer_id: []const u8) void {
+        while (true) {
+            self.lock(io);
+            const pending = self.popNextPendingSendLocked(peer_id) orelse {
+                self.unlock(io);
+                return;
+            };
+            self.unlock(io);
+
+            self.writePendingSend(io, pending);
         }
     }
 
     fn flushPendingSends(self: *Self, io: Io) void {
-        var peer_iter = self.outbound_streams.keyIterator();
-        while (peer_iter.next()) |peer_id| {
-            self.flushPendingSendsForPeer(io, peer_id.*);
+        while (true) {
+            self.lock(io);
+            const pending = self.popNextPendingSendLocked(null) orelse {
+                self.unlock(io);
+                return;
+            };
+            self.unlock(io);
+
+            self.writePendingSend(io, pending);
         }
     }
 
@@ -532,9 +557,11 @@ pub const Service = struct {
     /// Execute one heartbeat tick. Should be called periodically
     /// (e.g., every Config.heartbeat_interval_ms milliseconds).
     pub fn heartbeat(self: *Self, io: Io) !void {
-        self.lock(io);
-        defer self.unlock(io);
-        try self.router.heartbeat();
+        {
+            self.lock(io);
+            defer self.unlock(io);
+            try self.router.heartbeat();
+        }
         self.flushPendingSends(io);
     }
 
@@ -1063,5 +1090,73 @@ test "removePeer defers stream destruction until active inbound handler exits" {
 
     finish.set(io);
     try done.wait(io);
+    try std.testing.expectEqual(@as(usize, 1), deinit_count);
+}
+
+test "Service heartbeat flushes queued RPCs without holding state lock during stream writes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const LockCheckingStream = struct {
+        const Self = @This();
+
+        svc: *Service,
+        write_count: *usize,
+        lock_free_during_write: *bool,
+        deinit_count: ?*usize,
+
+        pub fn read(_: *Self, _: Io, _: []u8) !usize {
+            return 0;
+        }
+
+        pub fn write(self: *Self, write_io: Io, data: []const u8) !usize {
+            const lock_was_free = self.svc.state_mu.tryLock();
+            self.lock_free_during_write.* = lock_was_free;
+            if (lock_was_free) self.svc.state_mu.unlock(write_io);
+            self.write_count.* += 1;
+            return data.len;
+        }
+
+        pub fn closeRead(_: *Self, _: Io) void {}
+        pub fn closeWrite(_: *Self, _: Io) void {}
+        pub fn close(_: *Self, _: Io) void {}
+
+        pub fn deinit(self: *Self) void {
+            const counter = self.deinit_count orelse return;
+            counter.* += 1;
+            self.deinit_count = null;
+        }
+
+        pub fn detachOwnedStream(self: *Self) Self {
+            const detached = self.*;
+            self.deinit_count = null;
+            return detached;
+        }
+    };
+
+    const svc = try Service.init(allocator, .{});
+    defer svc.deinit(io);
+
+    var write_count: usize = 0;
+    var lock_free_during_write = false;
+    var deinit_count: usize = 0;
+    var stream = LockCheckingStream{
+        .svc = svc,
+        .write_count = &write_count,
+        .lock_free_during_write = &lock_free_during_write,
+        .deinit_count = &deinit_count,
+    };
+
+    try svc.handleOutbound(io, &stream, .{ .peer_id = @as(?[]const u8, "peer-1") });
+    try std.testing.expect(svc.outbound_streams.contains("peer-1"));
+    try std.testing.expect(svc.sendRpc("peer-1", "queued-gossip"));
+    try std.testing.expectEqual(@as(usize, 1), svc.pending_sends.items.len);
+
+    try svc.heartbeat(io);
+
+    try std.testing.expectEqual(@as(usize, 1), write_count);
+    try std.testing.expect(lock_free_during_write);
+    try std.testing.expectEqual(@as(usize, 0), svc.pending_sends.items.len);
+    svc.removePeer(io, "peer-1");
     try std.testing.expectEqual(@as(usize, 1), deinit_count);
 }
