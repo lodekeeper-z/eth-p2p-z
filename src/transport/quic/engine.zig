@@ -115,6 +115,21 @@ const DebugCounters = struct {
     has_unsent_retry_count: std.atomic.Value(u64) = .init(0),
 };
 
+const zero_before_data_read_close_threshold = 64;
+
+const ZeroBeforeDataAction = enum {
+    retry,
+    defensive_close,
+};
+
+fn zeroBeforeDataAction(spurious_read_count: u32) ZeroBeforeDataAction {
+    return if (spurious_read_count >= zero_before_data_read_close_threshold) .defensive_close else .retry;
+}
+
+fn armReadOnNewStream(_: bool) bool {
+    return false;
+}
+
 const ProcessWait = union(enum) {
     immediate,
     indefinite,
@@ -1725,11 +1740,14 @@ pub const QuicEngine = struct {
                 return null;
             }
         } else {
-            // Arm wantread immediately for inbound streams so lsquic
-            // delivers data via onRead before the stream is closed.
-            // Without this, Lighthouse can send data + half-close before
-            // our reader calls read(), causing UnexpectedEof.
-            _ = lsquic.lsquic_stream_wantread(s, 1);
+            // Do not arm wantread until the application asks to read.
+            // QuicStream.read() arms lsquic_stream_wantread lazily; arming here
+            // can create repeated zero-byte callbacks before STREAM payload has
+            // been decoded, which in production showed up as an immediate timer
+            // hot loop.
+            if (armReadOnNewStream(is_locally_initiated)) {
+                _ = lsquic.lsquic_stream_wantread(s, 1);
+            }
             const queued = tryQueueOneUncancelable(StreamEvent, &conn.stream_queue, engine.io, .{ .stream = stream }) catch |err| {
                 counterInc(&engine.debug.accept_queue_closed_count);
                 log.warn("onNewStream: inbound stream queue closed: {}", .{err});
@@ -1769,12 +1787,23 @@ pub const QuicEngine = struct {
         if (n == 0) {
             if (!stream.has_received_data) {
                 counterInc(&stream.conn.engine.debug.on_read_zero_before_data_count);
-                // No data yet — STREAM frames not decoded in this tick.
-                // With es_rw_once=1, lsquic won't re-call us this tick.
-                // Leave wantread armed; next process_conns tick will retry.
                 stream.spurious_read_count += 1;
-                if (stream.spurious_read_count <= 3) {
-                    log.debug("onRead: stream {d} no data yet (tick {d})", .{ stream_id, stream.spurious_read_count });
+                switch (zeroBeforeDataAction(stream.spurious_read_count)) {
+                    .retry => {
+                        if (stream.spurious_read_count <= 3) {
+                            log.debug("onRead: stream {d} no data yet (tick {d})", .{ stream_id, stream.spurious_read_count });
+                        }
+                    },
+                    .defensive_close => {
+                        log.warn("onRead: stream {d} repeated zero-byte reads before payload (count={d}); disarming and closing stream", .{
+                            stream_id,
+                            stream.spurious_read_count,
+                        });
+                        _ = lsquic.lsquic_stream_wantread(s, 0);
+                        stream.closeNoLock();
+                        stream.read_queue.close(stream.io);
+                        stream.write_queue.close(stream.io);
+                    },
                 }
                 return;
             }
@@ -2129,6 +2158,17 @@ fn sameFamilyAndPort(a: net.IpAddress, b: net.IpAddress) bool {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "zero-before-data read policy retries briefly then defensively closes" {
+    try std.testing.expectEqual(ZeroBeforeDataAction.retry, zeroBeforeDataAction(0));
+    try std.testing.expectEqual(ZeroBeforeDataAction.retry, zeroBeforeDataAction(zero_before_data_read_close_threshold - 1));
+    try std.testing.expectEqual(ZeroBeforeDataAction.defensive_close, zeroBeforeDataAction(zero_before_data_read_close_threshold));
+}
+
+test "new QUIC streams do not arm read callbacks before application read" {
+    try std.testing.expect(!armReadOnNewStream(true));
+    try std.testing.expect(!armReadOnNewStream(false));
+}
 
 test "CertVerifyCtx stores and retrieves by connection context" {
     const allocator = std.testing.allocator;
