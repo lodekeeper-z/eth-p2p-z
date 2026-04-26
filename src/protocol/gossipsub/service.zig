@@ -49,6 +49,8 @@ pub const Service = struct {
     const Self = @This();
     const RouterType = router_mod.Router(Self);
 
+    pub const DebugStats = RouterType.DebugStats;
+
     allocator: Allocator,
     router: RouterType,
     /// Pending outbound RPC data per peer.
@@ -594,6 +596,12 @@ pub const Service = struct {
         try self.router.handleRpc(from_peer, rpc_bytes);
     }
 
+    pub fn debugStatsSnapshot(self: *Self, io: Io) DebugStats {
+        self.lock(io);
+        defer self.unlock(io);
+        return self.router.debugStatsSnapshot();
+    }
+
     /// Drain all pending outbound RPCs. Caller owns the returned slice
     /// and must free each entry's `peer` and `data` slices, plus the slice itself.
     pub fn drainPendingSends(self: *Self, io: Io) []PendingRpc {
@@ -669,6 +677,37 @@ test "Service subscribe and unsubscribe" {
 
     try svc.subscribe(std.testing.io, "test-topic");
     try svc.unsubscribe(std.testing.io, "test-topic");
+}
+
+test "Service exposes router debug stats snapshot" {
+    const svc = try Service.init(std.testing.allocator, .{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = testMsgId,
+        .validation_mode = .manual,
+    });
+    defer svc.deinit(std.testing.io);
+
+    try svc.subscribe(std.testing.io, "test-topic");
+
+    var pub_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "hello",
+        .seqno = null,
+        .topic = "test-topic",
+        .signature = null,
+        .key = null,
+    }};
+    var rpc_msg = rpc.RPC{ .publish = &pub_msgs };
+    const encoded = rpc_msg.encode(std.testing.allocator) catch unreachable;
+    defer std.testing.allocator.free(encoded);
+
+    try svc.handleRpc(std.testing.io, "peer-1", encoded);
+
+    const stats = svc.debugStatsSnapshot(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 1), stats.inbound_rpc_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.publish_messages_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.message_manual_queued_total);
 }
 
 test "Service subscribe, publish, heartbeat" {

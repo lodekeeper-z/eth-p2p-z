@@ -106,7 +106,37 @@ pub fn Router(comptime Handler: type) type {
         // Heartbeat counter
         heartbeat_ticks: u64,
 
+        // Low-cardinality cumulative counters for diagnosing router-level
+        // gossipsub ingress/admission without changing routing behaviour.
+        debug_stats: DebugStats,
+
         const PeerSet = std.StringHashMap(void);
+
+        pub const DebugStats = struct {
+            inbound_rpc_total: u64 = 0,
+            publish_messages_total: u64 = 0,
+
+            message_empty_topic_total: u64 = 0,
+            message_policy_rejected_total: u64 = 0,
+            message_id_error_total: u64 = 0,
+            message_duplicate_pending_total: u64 = 0,
+            message_duplicate_validated_total: u64 = 0,
+            message_duplicate_discarded_total: u64 = 0,
+            message_duplicate_seen_total: u64 = 0,
+            message_pending_limit_total: u64 = 0,
+            message_manual_queued_total: u64 = 0,
+            message_eager_cached_total: u64 = 0,
+            message_unsubscribed_total: u64 = 0,
+
+            event_queue_disabled_total: u64 = 0,
+            event_queue_dropped_total: u64 = 0,
+            events_message_appended_total: u64 = 0,
+            events_subscription_appended_total: u64 = 0,
+            events_graft_appended_total: u64 = 0,
+            events_prune_appended_total: u64 = 0,
+            events_score_appended_total: u64 = 0,
+            events_peer_extensions_appended_total: u64 = 0,
+        };
 
         /// v1.1: Per-peer score tracking.
         const PeerScore = struct {
@@ -256,6 +286,7 @@ pub fn Router(comptime Handler: type) type {
                 .topic_score_params = topic_params orelse std.StringHashMap(TopicScoreParams).init(allocator),
                 .events = .empty,
                 .heartbeat_ticks = 0,
+                .debug_stats = .{},
             };
         }
 
@@ -412,6 +443,7 @@ pub fn Router(comptime Handler: type) type {
         /// Handle an incoming RPC from a peer.
         /// The `rpc_bytes` should be the protobuf payload (without varint length prefix).
         pub fn handleRpc(self: *Self, from_peer: []const u8, rpc_bytes: []const u8) !void {
+            self.debug_stats.inbound_rpc_total += 1;
             var reader = rpc.RPCReader.init(rpc_bytes) catch return;
 
             // Handle subscriptions
@@ -425,6 +457,7 @@ pub fn Router(comptime Handler: type) type {
             var pub_count: u32 = 0;
             while (reader.publishNext()) |msg_reader| {
                 pub_count += 1;
+                self.debug_stats.publish_messages_total += 1;
                 try self.handleIncomingMessage(from_peer, &msg_reader);
             }
             if (pub_count > 0) {
@@ -530,6 +563,10 @@ pub fn Router(comptime Handler: type) type {
             return self.mcache.pendingValidationStats(self.handler.currentTimeMs());
         }
 
+        pub fn debugStatsSnapshot(self: *const Self) DebugStats {
+            return self.debug_stats;
+        }
+
         /// Report the application validation outcome for a pending inbound
         /// message. Returns false when the message is no longer pending.
         pub fn reportValidationResult(self: *Self, msg_id: []const u8, result: ValidationResult) bool {
@@ -607,14 +644,26 @@ pub fn Router(comptime Handler: type) type {
         }
 
         fn appendOwnedEvent(self: *Self, event: Event) !void {
-            if (self.config.max_event_queue == 0) return;
+            if (self.config.max_event_queue == 0) {
+                self.debug_stats.event_queue_disabled_total += 1;
+                return;
+            }
             if (self.events.items.len >= self.config.max_event_queue) {
+                self.debug_stats.event_queue_dropped_total += 1;
                 var dropped = self.events.orderedRemove(0);
                 dropped.deinit(self.allocator);
             }
             var owned = try self.makeOwnedEvent(event);
             errdefer owned.deinit(self.allocator);
             try self.events.append(self.allocator, owned);
+            switch (event) {
+                .message => self.debug_stats.events_message_appended_total += 1,
+                .subscription_changed => self.debug_stats.events_subscription_appended_total += 1,
+                .graft => self.debug_stats.events_graft_appended_total += 1,
+                .prune => self.debug_stats.events_prune_appended_total += 1,
+                .score_below_threshold => self.debug_stats.events_score_appended_total += 1,
+                .peer_extensions => self.debug_stats.events_peer_extensions_appended_total += 1,
+            }
         }
 
         fn compactSeenFifo(self: *Self) void {
@@ -848,8 +897,14 @@ pub fn Router(comptime Handler: type) type {
                 if (from) |f| f.len else @as(usize, 0), if (seqno) |s| s.len else @as(usize, 0),
                 is_sub,
             });
-            if (topic.len == 0) return;
-            if (!self.validateIncomingMessagePolicy(from_peer, topic, msg_reader)) return;
+            if (topic.len == 0) {
+                self.debug_stats.message_empty_topic_total += 1;
+                return;
+            }
+            if (!self.validateIncomingMessagePolicy(from_peer, topic, msg_reader)) {
+                self.debug_stats.message_policy_rejected_total += 1;
+                return;
+            }
 
             // Build a Message for ID computation and caching
             const msg = rpc.Message{
@@ -862,22 +917,33 @@ pub fn Router(comptime Handler: type) type {
             };
 
             // Generate message ID
-            const mid = self.config.msg_id_fn(self.allocator, &msg) catch return;
+            const mid = self.config.msg_id_fn(self.allocator, &msg) catch {
+                self.debug_stats.message_id_error_total += 1;
+                return;
+            };
             defer self.allocator.free(mid);
 
             // Dedup check
             switch (self.mcache.entryState(mid)) {
                 .pending => {
+                    self.debug_stats.message_duplicate_pending_total += 1;
                     _ = self.mcache.notePendingOriginatingPeer(mid, from_peer) catch {};
                     return;
                 },
-                .validated, .discarded => {
+                .validated => {
+                    self.debug_stats.message_duplicate_validated_total += 1;
+                    log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
+                    return;
+                },
+                .discarded => {
+                    self.debug_stats.message_duplicate_discarded_total += 1;
                     log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
                     return;
                 },
                 .missing => {},
             }
             if (self.hasSeen(mid)) {
+                self.debug_stats.message_duplicate_seen_total += 1;
                 log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
                 return;
             }
@@ -888,6 +954,7 @@ pub fn Router(comptime Handler: type) type {
 
             if (uses_manual_validation) {
                 if (self.mcache.pendingCount() >= self.config.max_pending_validations) {
+                    self.debug_stats.message_pending_limit_total += 1;
                     log.warn("dropping inbound message because pending validation limits were reached", .{});
                     return;
                 }
@@ -909,6 +976,7 @@ pub fn Router(comptime Handler: type) type {
                     .from = msg.from,
                     .seqno = msg.seqno,
                 } });
+                self.debug_stats.message_manual_queued_total += 1;
                 return;
             }
 
@@ -924,6 +992,7 @@ pub fn Router(comptime Handler: type) type {
             }
             try self.rememberSeen(mid);
             eager_seen_recorded = true;
+            self.debug_stats.message_eager_cached_total += 1;
 
             // v1.1: Record first delivery for scoring
             self.recordFirstDelivery(from_peer, topic);
@@ -950,6 +1019,8 @@ pub fn Router(comptime Handler: type) type {
                     .from = msg.from,
                     .seqno = msg.seqno,
                 } });
+            } else {
+                self.debug_stats.message_unsubscribed_total += 1;
             }
 
             // Forward to mesh peers (excluding source)
@@ -2317,6 +2388,119 @@ test "Router manual validation ignore does not cache or forward" {
     try std.testing.expect(router.mcache.get(events[0].message.msg_id) == null);
     try std.testing.expectEqual(mcache_mod.EntryState.discarded, router.mcache.entryState(events[0].message.msg_id));
     try std.testing.expectEqual(@as(usize, 0), router.pendingValidationStats().count);
+}
+
+test "Router debug stats classify inbound publish admission outcomes" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+        .max_pending_validations = 1,
+    }, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    for ([_][]const u8{ "peer-1", "peer-2" }) |peer| {
+        try handler.markConnected(peer);
+        try router.addPeer(peer);
+        try addPeerSubscription(&router, peer, "topic-a");
+    }
+    freeEvents(allocator, try router.drainEvents());
+    const baseline_stats = router.debugStatsSnapshot();
+
+    var first_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "first",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var first_rpc = rpc.RPC{ .publish = &first_msgs };
+    const first_encoded = first_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(first_encoded);
+    try router.handleRpc("peer-1", first_encoded);
+
+    const first_events = try router.drainEvents();
+    defer freeEvents(allocator, first_events);
+    try std.testing.expectEqual(@as(usize, 1), first_events.len);
+
+    var duplicate_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "first",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var duplicate_rpc = rpc.RPC{ .publish = &duplicate_msgs };
+    const duplicate_encoded = duplicate_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(duplicate_encoded);
+    try router.handleRpc("peer-2", duplicate_encoded);
+
+    var saturated_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "second",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var saturated_rpc = rpc.RPC{ .publish = &saturated_msgs };
+    const saturated_encoded = saturated_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(saturated_encoded);
+    try router.handleRpc("peer-2", saturated_encoded);
+
+    const stats = router.debugStatsSnapshot();
+    try std.testing.expectEqual(@as(u64, 3), stats.inbound_rpc_total - baseline_stats.inbound_rpc_total);
+    try std.testing.expectEqual(@as(u64, 3), stats.publish_messages_total - baseline_stats.publish_messages_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.message_manual_queued_total - baseline_stats.message_manual_queued_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.message_duplicate_pending_total - baseline_stats.message_duplicate_pending_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.message_pending_limit_total - baseline_stats.message_pending_limit_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.events_message_appended_total - baseline_stats.events_message_appended_total);
+}
+
+test "Router debug stats classify event queue drops" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+        .max_event_queue = 1,
+    }, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    try handler.markConnected("peer-1");
+    try router.addPeer("peer-1");
+    try addPeerSubscription(&router, "peer-1", "topic-a");
+
+    var pub_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "payload",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var rpc_msg = rpc.RPC{ .publish = &pub_msgs };
+    const encoded = rpc_msg.encode(allocator) catch unreachable;
+    defer allocator.free(encoded);
+    try router.handleRpc("peer-1", encoded);
+
+    const stats = router.debugStatsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.event_queue_dropped_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.events_subscription_appended_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.events_message_appended_total);
 }
 
 test "Router manual validation saturation does not poison seen dedup" {
