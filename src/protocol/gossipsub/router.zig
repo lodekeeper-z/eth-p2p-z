@@ -109,12 +109,19 @@ pub fn Router(comptime Handler: type) type {
         // Low-cardinality cumulative counters for diagnosing router-level
         // gossipsub ingress/admission without changing routing behaviour.
         debug_stats: DebugStats,
+        debug_topic_stats: std.StringHashMap(DebugTopicStats),
 
         const PeerSet = std.StringHashMap(void);
 
         pub const DebugStats = struct {
             inbound_rpc_total: u64 = 0,
             publish_messages_total: u64 = 0,
+
+            control_ihave_total: u64 = 0,
+            control_iwant_total: u64 = 0,
+            control_graft_total: u64 = 0,
+            control_prune_total: u64 = 0,
+            control_idontwant_total: u64 = 0,
 
             message_empty_topic_total: u64 = 0,
             message_policy_rejected_total: u64 = 0,
@@ -136,6 +143,25 @@ pub fn Router(comptime Handler: type) type {
             events_prune_appended_total: u64 = 0,
             events_score_appended_total: u64 = 0,
             events_peer_extensions_appended_total: u64 = 0,
+        };
+
+        pub const DebugTopicStats = struct {
+            publish_messages_total: u64 = 0,
+            message_empty_topic_total: u64 = 0,
+            message_policy_rejected_total: u64 = 0,
+            message_id_error_total: u64 = 0,
+            message_duplicate_pending_total: u64 = 0,
+            message_duplicate_validated_total: u64 = 0,
+            message_duplicate_discarded_total: u64 = 0,
+            message_duplicate_seen_total: u64 = 0,
+            message_pending_limit_total: u64 = 0,
+            message_manual_queued_total: u64 = 0,
+            message_eager_cached_total: u64 = 0,
+            message_unsubscribed_total: u64 = 0,
+
+            control_ihave_total: u64 = 0,
+            control_graft_total: u64 = 0,
+            control_prune_total: u64 = 0,
         };
 
         /// v1.1: Per-peer score tracking.
@@ -287,10 +313,13 @@ pub fn Router(comptime Handler: type) type {
                 .events = .empty,
                 .heartbeat_ticks = 0,
                 .debug_stats = .{},
+                .debug_topic_stats = std.StringHashMap(DebugTopicStats).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
+            deinitKeyedMap(&self.debug_topic_stats, self.allocator);
+
             for (self.events.items) |*event| {
                 event.deinit(self.allocator);
             }
@@ -458,6 +487,8 @@ pub fn Router(comptime Handler: type) type {
             while (reader.publishNext()) |msg_reader| {
                 pub_count += 1;
                 self.debug_stats.publish_messages_total += 1;
+                const topic = msg_reader.getTopic();
+                if (topic.len > 0) self.incrementTopicPublish(topic);
                 try self.handleIncomingMessage(from_peer, &msg_reader);
             }
             if (pub_count > 0) {
@@ -565,6 +596,37 @@ pub fn Router(comptime Handler: type) type {
 
         pub fn debugStatsSnapshot(self: *const Self) DebugStats {
             return self.debug_stats;
+        }
+
+        pub fn debugTopicStatsSnapshot(self: *const Self, topic: []const u8) DebugTopicStats {
+            return self.debug_topic_stats.get(topic) orelse .{};
+        }
+
+        fn debugTopicStatsPtr(self: *Self, topic: []const u8) !*DebugTopicStats {
+            const gop = try getOrPutOwnedKey(&self.debug_topic_stats, self.allocator, topic);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            return gop.value_ptr;
+        }
+
+        fn incrementTopicPublish(self: *Self, topic: []const u8) void {
+            self.incrementTopicCounter(topic, "publish_messages_total");
+        }
+
+        fn incrementTopicControlIHave(self: *Self, topic: []const u8) void {
+            self.incrementTopicCounter(topic, "control_ihave_total");
+        }
+
+        fn incrementTopicControlGraft(self: *Self, topic: []const u8) void {
+            self.incrementTopicCounter(topic, "control_graft_total");
+        }
+
+        fn incrementTopicControlPrune(self: *Self, topic: []const u8) void {
+            self.incrementTopicCounter(topic, "control_prune_total");
+        }
+
+        fn incrementTopicCounter(self: *Self, topic: []const u8, comptime field_name: []const u8) void {
+            const stats = self.debugTopicStatsPtr(topic) catch return;
+            @field(stats, field_name) += 1;
         }
 
         /// Report the application validation outcome for a pending inbound
@@ -903,6 +965,7 @@ pub fn Router(comptime Handler: type) type {
             }
             if (!self.validateIncomingMessagePolicy(from_peer, topic, msg_reader)) {
                 self.debug_stats.message_policy_rejected_total += 1;
+                self.incrementTopicCounter(topic, "message_policy_rejected_total");
                 return;
             }
 
@@ -919,6 +982,7 @@ pub fn Router(comptime Handler: type) type {
             // Generate message ID
             const mid = self.config.msg_id_fn(self.allocator, &msg) catch {
                 self.debug_stats.message_id_error_total += 1;
+                self.incrementTopicCounter(topic, "message_id_error_total");
                 return;
             };
             defer self.allocator.free(mid);
@@ -927,16 +991,19 @@ pub fn Router(comptime Handler: type) type {
             switch (self.mcache.entryState(mid)) {
                 .pending => {
                     self.debug_stats.message_duplicate_pending_total += 1;
+                    self.incrementTopicCounter(topic, "message_duplicate_pending_total");
                     _ = self.mcache.notePendingOriginatingPeer(mid, from_peer) catch {};
                     return;
                 },
                 .validated => {
                     self.debug_stats.message_duplicate_validated_total += 1;
+                    self.incrementTopicCounter(topic, "message_duplicate_validated_total");
                     log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
                     return;
                 },
                 .discarded => {
                     self.debug_stats.message_duplicate_discarded_total += 1;
+                    self.incrementTopicCounter(topic, "message_duplicate_discarded_total");
                     log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
                     return;
                 },
@@ -944,6 +1011,7 @@ pub fn Router(comptime Handler: type) type {
             }
             if (self.hasSeen(mid)) {
                 self.debug_stats.message_duplicate_seen_total += 1;
+                self.incrementTopicCounter(topic, "message_duplicate_seen_total");
                 log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
                 return;
             }
@@ -955,6 +1023,7 @@ pub fn Router(comptime Handler: type) type {
             if (uses_manual_validation) {
                 if (self.mcache.pendingCount() >= self.config.max_pending_validations) {
                     self.debug_stats.message_pending_limit_total += 1;
+                    self.incrementTopicCounter(topic, "message_pending_limit_total");
                     log.warn("dropping inbound message because pending validation limits were reached", .{});
                     return;
                 }
@@ -977,6 +1046,7 @@ pub fn Router(comptime Handler: type) type {
                     .seqno = msg.seqno,
                 } });
                 self.debug_stats.message_manual_queued_total += 1;
+                self.incrementTopicCounter(topic, "message_manual_queued_total");
                 return;
             }
 
@@ -993,6 +1063,7 @@ pub fn Router(comptime Handler: type) type {
             try self.rememberSeen(mid);
             eager_seen_recorded = true;
             self.debug_stats.message_eager_cached_total += 1;
+            self.incrementTopicCounter(topic, "message_eager_cached_total");
 
             // v1.1: Record first delivery for scoring
             self.recordFirstDelivery(from_peer, topic);
@@ -1021,6 +1092,7 @@ pub fn Router(comptime Handler: type) type {
                 } });
             } else {
                 self.debug_stats.message_unsubscribed_total += 1;
+                self.incrementTopicCounter(topic, "message_unsubscribed_total");
             }
 
             // Forward to mesh peers (excluding source)
@@ -1108,26 +1180,37 @@ pub fn Router(comptime Handler: type) type {
         fn handleControl(self: *Self, from_peer: []const u8, control: *rpc.ControlMessageReader) !void {
             // IHAVE
             while (control.ihaveNext()) |ihave| {
+                self.debug_stats.control_ihave_total += 1;
+                const topic = ihave.getTopicID();
+                if (topic.len > 0) self.incrementTopicControlIHave(topic);
                 try self.handleIHave(from_peer, &ihave);
             }
 
             // IWANT
             while (control.iwantNext()) |iwant| {
+                self.debug_stats.control_iwant_total += 1;
                 try self.handleIWant(from_peer, &iwant);
             }
 
             // GRAFT
             while (control.graftNext()) |graft| {
+                self.debug_stats.control_graft_total += 1;
+                const topic = graft.getTopicID();
+                if (topic.len > 0) self.incrementTopicControlGraft(topic);
                 try self.handleGraft(from_peer, &graft);
             }
 
             // PRUNE
             while (control.pruneNext()) |prune| {
+                self.debug_stats.control_prune_total += 1;
+                const topic = prune.getTopicID();
+                if (topic.len > 0) self.incrementTopicControlPrune(topic);
                 try self.handlePrune(from_peer, &prune);
             }
 
             // v1.2: IDONTWANT — track which message IDs this peer already has
             while (control.idontwantNext()) |idontwant| {
+                self.debug_stats.control_idontwant_total += 1;
                 try self.handleIDontWant(from_peer, &idontwant);
             }
 
@@ -2463,6 +2546,86 @@ test "Router debug stats classify inbound publish admission outcomes" {
     try std.testing.expectEqual(@as(u64, 1), stats.message_duplicate_pending_total - baseline_stats.message_duplicate_pending_total);
     try std.testing.expectEqual(@as(u64, 1), stats.message_pending_limit_total - baseline_stats.message_pending_limit_total);
     try std.testing.expectEqual(@as(u64, 1), stats.events_message_appended_total - baseline_stats.events_message_appended_total);
+}
+
+test "Router debug stats attribute publish drops and control by topic" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+        .max_pending_validations = 1,
+    }, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    for ([_][]const u8{ "peer-1", "peer-2" }) |peer| {
+        try handler.markConnected(peer);
+        try router.addPeer(peer);
+        try addPeerSubscription(&router, peer, "topic-a");
+    }
+    freeEvents(allocator, try router.drainEvents());
+
+    var first_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "first",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var first_rpc = rpc.RPC{ .publish = &first_msgs };
+    const first_encoded = first_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(first_encoded);
+    try router.handleRpc("peer-1", first_encoded);
+    freeEvents(allocator, try router.drainEvents());
+
+    var saturated_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "second",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var saturated_rpc = rpc.RPC{ .publish = &saturated_msgs };
+    const saturated_encoded = saturated_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(saturated_encoded);
+    try router.handleRpc("peer-2", saturated_encoded);
+
+    var ihave_msgs = [_]?[]const u8{"unseen-mid"};
+    var ihave_arr = [_]?rpc.ControlIHave{.{
+        .topic_i_d = "topic-a",
+        .message_i_ds = &ihave_msgs,
+    }};
+    var graft_arr = [_]?rpc.ControlGraft{.{ .topic_i_d = "topic-a" }};
+    var prune_arr = [_]?rpc.ControlPrune{.{ .topic_i_d = "topic-a" }};
+    const control = rpc.ControlMessage{
+        .ihave = &ihave_arr,
+        .graft = &graft_arr,
+        .prune = &prune_arr,
+    };
+    var control_rpc = rpc.RPC{ .control = control };
+    const control_encoded = control_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(control_encoded);
+    try router.handleRpc("peer-2", control_encoded);
+
+    const topic_stats = router.debugTopicStatsSnapshot("topic-a");
+    try std.testing.expectEqual(@as(u64, 2), topic_stats.publish_messages_total);
+    try std.testing.expectEqual(@as(u64, 1), topic_stats.message_manual_queued_total);
+    try std.testing.expectEqual(@as(u64, 1), topic_stats.message_pending_limit_total);
+    try std.testing.expectEqual(@as(u64, 1), topic_stats.control_ihave_total);
+    try std.testing.expectEqual(@as(u64, 1), topic_stats.control_graft_total);
+    try std.testing.expectEqual(@as(u64, 1), topic_stats.control_prune_total);
+
+    const stats = router.debugStatsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.control_ihave_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.control_graft_total);
+    try std.testing.expectEqual(@as(u64, 1), stats.control_prune_total);
 }
 
 test "Router debug stats classify event queue drops" {
