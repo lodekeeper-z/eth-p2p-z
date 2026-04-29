@@ -57,6 +57,14 @@ pub const Service = struct {
     /// Populated by the Router via sendRpc; drained by the integration layer.
     pending_sends: std.ArrayList(PendingRpc),
     pending_send_bytes: usize,
+    pending_send_max_count_drops_total: u64,
+    pending_send_max_bytes_drops_total: u64,
+    pending_send_flush_attempts_total: u64,
+    pending_send_flush_success_total: u64,
+    pending_send_flush_write_errors_total: u64,
+    pending_send_flush_zero_writes_total: u64,
+    pending_send_flush_no_stream_skipped_total: u64,
+    pending_send_remove_peer_dropped_total: u64,
     /// PRNG state for randomU64 (xorshift64).
     rng_state: u64,
     /// Current time in milliseconds, set externally via setTime.
@@ -173,6 +181,24 @@ pub const Service = struct {
         peer: []const u8,
         /// Encoded RPC data (owned copy).
         data: []const u8,
+        /// Service time, in milliseconds, when this RPC was queued.
+        queued_at_ms: u64 = 0,
+    };
+
+    pub const PendingSendDebugStats = struct {
+        pending_count: usize = 0,
+        pending_bytes: usize = 0,
+        with_stream_count: usize = 0,
+        without_stream_count: usize = 0,
+        oldest_age_ms: u64 = 0,
+        max_count_drops_total: u64 = 0,
+        max_bytes_drops_total: u64 = 0,
+        flush_attempts_total: u64 = 0,
+        flush_success_total: u64 = 0,
+        flush_write_errors_total: u64 = 0,
+        flush_zero_writes_total: u64 = 0,
+        flush_no_stream_skipped_total: u64 = 0,
+        remove_peer_dropped_total: u64 = 0,
     };
 
     /// Protocol identifier for Switch integration.
@@ -189,6 +215,14 @@ pub const Service = struct {
             .router = undefined,
             .pending_sends = .empty,
             .pending_send_bytes = 0,
+            .pending_send_max_count_drops_total = 0,
+            .pending_send_max_bytes_drops_total = 0,
+            .pending_send_flush_attempts_total = 0,
+            .pending_send_flush_success_total = 0,
+            .pending_send_flush_write_errors_total = 0,
+            .pending_send_flush_zero_writes_total = 0,
+            .pending_send_flush_no_stream_skipped_total = 0,
+            .pending_send_remove_peer_dropped_total = 0,
             .rng_state = 12345,
             .time_ms = 0,
             .outbound_streams = std.StringHashMap(*InstalledPeerStream).init(allocator),
@@ -373,17 +407,24 @@ pub const Service = struct {
             return false;
         };
         const queued_bytes = peer_copy.len + data_copy.len;
-        if (self.pending_sends.items.len >= self.router.config.max_pending_sends or
-            self.pending_send_bytes + queued_bytes > self.router.config.max_pending_send_bytes)
-        {
+        if (self.pending_sends.items.len >= self.router.config.max_pending_sends) {
             self.allocator.free(peer_copy);
             self.allocator.free(data_copy);
+            self.pending_send_max_count_drops_total += 1;
+            log.warn("gossipsub: dropping outbound RPC because pending queue count limit was reached", .{});
+            return false;
+        }
+        if (self.pending_send_bytes + queued_bytes > self.router.config.max_pending_send_bytes) {
+            self.allocator.free(peer_copy);
+            self.allocator.free(data_copy);
+            self.pending_send_max_bytes_drops_total += 1;
             log.warn("gossipsub: dropping outbound RPC because pending queue limits were reached", .{});
             return false;
         }
         self.pending_sends.append(self.allocator, .{
             .peer = peer_copy,
             .data = data_copy,
+            .queued_at_ms = self.time_ms,
         }) catch {
             self.allocator.free(peer_copy);
             self.allocator.free(data_copy);
@@ -407,7 +448,10 @@ pub const Service = struct {
                 if (!std.mem.eql(u8, pending.peer, peer_id)) continue;
             }
 
-            const managed_stream = self.outbound_streams.get(pending.peer) orelse continue;
+            const managed_stream = self.outbound_streams.get(pending.peer) orelse {
+                self.pending_send_flush_no_stream_skipped_total += 1;
+                continue;
+            };
             managed_stream.retain();
             const removed = self.pending_sends.orderedRemove(i);
             self.pending_send_bytes -= removed.peer.len + removed.data.len;
@@ -425,18 +469,22 @@ pub const Service = struct {
         defer self.allocator.free(pending.peer);
         defer self.allocator.free(pending.data);
 
+        self.pending_send_flush_attempts_total += 1;
         var total: usize = 0;
         while (total < pending.data.len) {
             const n = pending.stream.write(io, pending.data[total..]) catch |err| {
+                self.pending_send_flush_write_errors_total += 1;
                 log.debug("gossipsub: dropping queued RPC to peer after stream write error: {}", .{err});
                 return;
             };
             if (n == 0) {
+                self.pending_send_flush_zero_writes_total += 1;
                 log.debug("gossipsub: dropping queued RPC to peer after zero-length stream write", .{});
                 return;
             }
             total += n;
         }
+        self.pending_send_flush_success_total += 1;
     }
 
     fn flushPendingSendsForPeer(self: *Self, io: Io, peer_id: []const u8) void {
@@ -478,6 +526,7 @@ pub const Service = struct {
             self.pending_send_bytes -= removed.peer.len + removed.data.len;
             self.allocator.free(removed.peer);
             self.allocator.free(removed.data);
+            self.pending_send_remove_peer_dropped_total += 1;
         }
     }
 
@@ -600,6 +649,38 @@ pub const Service = struct {
         self.lock(io);
         defer self.unlock(io);
         return self.router.debugStatsSnapshot();
+    }
+
+    pub fn pendingSendDebugSnapshotLocked(self: *Self) PendingSendDebugStats {
+        var stats = PendingSendDebugStats{
+            .pending_count = self.pending_sends.items.len,
+            .pending_bytes = self.pending_send_bytes,
+            .max_count_drops_total = self.pending_send_max_count_drops_total,
+            .max_bytes_drops_total = self.pending_send_max_bytes_drops_total,
+            .flush_attempts_total = self.pending_send_flush_attempts_total,
+            .flush_success_total = self.pending_send_flush_success_total,
+            .flush_write_errors_total = self.pending_send_flush_write_errors_total,
+            .flush_zero_writes_total = self.pending_send_flush_zero_writes_total,
+            .flush_no_stream_skipped_total = self.pending_send_flush_no_stream_skipped_total,
+            .remove_peer_dropped_total = self.pending_send_remove_peer_dropped_total,
+        };
+        for (self.pending_sends.items) |pending| {
+            if (self.outbound_streams.contains(pending.peer)) {
+                stats.with_stream_count += 1;
+            } else {
+                stats.without_stream_count += 1;
+            }
+            if (self.time_ms >= pending.queued_at_ms) {
+                stats.oldest_age_ms = @max(stats.oldest_age_ms, self.time_ms - pending.queued_at_ms);
+            }
+        }
+        return stats;
+    }
+
+    pub fn pendingSendDebugSnapshot(self: *Self, io: Io) PendingSendDebugStats {
+        self.lock(io);
+        defer self.unlock(io);
+        return self.pendingSendDebugSnapshotLocked();
     }
 
     /// Drain all pending outbound RPCs. Caller owns the returned slice
@@ -909,6 +990,30 @@ test "Service removePeer drops queued RPCs for that peer" {
     try std.testing.expectEqual(@as(usize, 1), svc.pending_sends.items.len);
     try std.testing.expectEqualStrings("peer-2", svc.pending_sends.items[0].peer);
     try std.testing.expectEqual(@as(usize, "peer-2".len + "queued-b".len), svc.pending_send_bytes);
+}
+
+test "Service pending send attribution separates queued RPCs with and without streams" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const svc = try Service.init(allocator, .{});
+    defer svc.deinit(io);
+
+    var writes: std.ArrayList(u8) = .empty;
+    defer writes.deinit(allocator);
+    var stream = RecordingStream{ .writes = &writes };
+    try svc.handleOutbound(io, &stream, .{ .peer_id = @as(?[]const u8, "peer-with-stream") });
+
+    svc.setTime(io, 1000);
+    try std.testing.expect(svc.sendRpc("peer-with-stream", "queued-a"));
+    svc.setTime(io, 1250);
+    try std.testing.expect(svc.sendRpc("peer-without-stream", "queued-b"));
+
+    const stats = svc.pendingSendDebugSnapshot(io);
+    try std.testing.expectEqual(@as(usize, 2), stats.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.with_stream_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.without_stream_count);
+    try std.testing.expectEqual(@as(u64, 250), stats.oldest_age_ms);
 }
 
 test "Service setTime and setSeed" {
