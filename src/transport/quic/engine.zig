@@ -78,6 +78,21 @@ pub const QuicDebugStats = struct {
     read_queue_closed_count: u64 = 0,
     accept_queue_full_count: u64 = 0,
     accept_queue_closed_count: u64 = 0,
+    connect_attempt_count: u64 = 0,
+    handshake_ok_count: u64 = 0,
+    handshake_failed_status_count: u64 = 0,
+    handshake_failed_queue_closed_count: u64 = 0,
+    handshake_failed_signal_count: u64 = 0,
+    handshake_failed_missing_peer_id_count: u64 = 0,
+    conn_close_frame_count: u64 = 0,
+    conn_close_frame_graceful_count: u64 = 0,
+    conn_close_frame_error_count: u64 = 0,
+    conn_closed_count: u64 = 0,
+    conn_closed_before_handshake_count: u64 = 0,
+    conn_closed_after_handshake_count: u64 = 0,
+    udp_datagram_in_count: u64 = 0,
+    udp_bytes_in: u64 = 0,
+    packet_in_error_count: u64 = 0,
     packets_out_call_count: u64 = 0,
     packets_out_sent_count: u64 = 0,
     packets_out_eagain_count: u64 = 0,
@@ -108,6 +123,21 @@ const DebugCounters = struct {
     read_queue_closed_count: std.atomic.Value(u64) = .init(0),
     accept_queue_full_count: std.atomic.Value(u64) = .init(0),
     accept_queue_closed_count: std.atomic.Value(u64) = .init(0),
+    connect_attempt_count: std.atomic.Value(u64) = .init(0),
+    handshake_ok_count: std.atomic.Value(u64) = .init(0),
+    handshake_failed_status_count: std.atomic.Value(u64) = .init(0),
+    handshake_failed_queue_closed_count: std.atomic.Value(u64) = .init(0),
+    handshake_failed_signal_count: std.atomic.Value(u64) = .init(0),
+    handshake_failed_missing_peer_id_count: std.atomic.Value(u64) = .init(0),
+    conn_close_frame_count: std.atomic.Value(u64) = .init(0),
+    conn_close_frame_graceful_count: std.atomic.Value(u64) = .init(0),
+    conn_close_frame_error_count: std.atomic.Value(u64) = .init(0),
+    conn_closed_count: std.atomic.Value(u64) = .init(0),
+    conn_closed_before_handshake_count: std.atomic.Value(u64) = .init(0),
+    conn_closed_after_handshake_count: std.atomic.Value(u64) = .init(0),
+    udp_datagram_in_count: std.atomic.Value(u64) = .init(0),
+    udp_bytes_in: std.atomic.Value(u64) = .init(0),
+    packet_in_error_count: std.atomic.Value(u64) = .init(0),
     packets_out_call_count: std.atomic.Value(u64) = .init(0),
     packets_out_sent_count: std.atomic.Value(u64) = .init(0),
     packets_out_eagain_count: std.atomic.Value(u64) = .init(0),
@@ -748,15 +778,29 @@ pub const QuicConnection = struct {
     pub fn waitHandshake(self: *QuicConnection, io: Io) !PeerId {
         // If already completed (e.g. server path), return immediately
         if (self.hsk_completed) {
-            return self.peer_id orelse error.HandshakeFailed;
+            if (self.peer_id) |peer_id| return peer_id;
+            counterInc(&self.engine.debug.handshake_failed_missing_peer_id_count);
+            return error.HandshakeFailed;
         }
         const result = self.hsk_queue.getOne(io) catch |err| switch (err) {
-            error.Closed => return error.HandshakeFailed,
-            error.Canceled => return error.HandshakeFailed,
+            error.Closed => {
+                counterInc(&self.engine.debug.handshake_failed_queue_closed_count);
+                return error.HandshakeFailed;
+            },
+            error.Canceled => {
+                counterInc(&self.engine.debug.handshake_failed_queue_closed_count);
+                return error.HandshakeFailed;
+            },
         };
         return switch (result) {
-            .ok => self.peer_id orelse error.HandshakeFailed,
-            .failed => error.HandshakeFailed,
+            .ok => self.peer_id orelse blk: {
+                counterInc(&self.engine.debug.handshake_failed_missing_peer_id_count);
+                break :blk error.HandshakeFailed;
+            },
+            .failed => blk: {
+                counterInc(&self.engine.debug.handshake_failed_signal_count);
+                break :blk error.HandshakeFailed;
+            },
         };
     }
 
@@ -1218,6 +1262,21 @@ pub const QuicEngine = struct {
             .read_queue_closed_count = self.debug.read_queue_closed_count.load(.monotonic),
             .accept_queue_full_count = self.debug.accept_queue_full_count.load(.monotonic),
             .accept_queue_closed_count = self.debug.accept_queue_closed_count.load(.monotonic),
+            .connect_attempt_count = self.debug.connect_attempt_count.load(.monotonic),
+            .handshake_ok_count = self.debug.handshake_ok_count.load(.monotonic),
+            .handshake_failed_status_count = self.debug.handshake_failed_status_count.load(.monotonic),
+            .handshake_failed_queue_closed_count = self.debug.handshake_failed_queue_closed_count.load(.monotonic),
+            .handshake_failed_signal_count = self.debug.handshake_failed_signal_count.load(.monotonic),
+            .handshake_failed_missing_peer_id_count = self.debug.handshake_failed_missing_peer_id_count.load(.monotonic),
+            .conn_close_frame_count = self.debug.conn_close_frame_count.load(.monotonic),
+            .conn_close_frame_graceful_count = self.debug.conn_close_frame_graceful_count.load(.monotonic),
+            .conn_close_frame_error_count = self.debug.conn_close_frame_error_count.load(.monotonic),
+            .conn_closed_count = self.debug.conn_closed_count.load(.monotonic),
+            .conn_closed_before_handshake_count = self.debug.conn_closed_before_handshake_count.load(.monotonic),
+            .conn_closed_after_handshake_count = self.debug.conn_closed_after_handshake_count.load(.monotonic),
+            .udp_datagram_in_count = self.debug.udp_datagram_in_count.load(.monotonic),
+            .udp_bytes_in = self.debug.udp_bytes_in.load(.monotonic),
+            .packet_in_error_count = self.debug.packet_in_error_count.load(.monotonic),
             .packets_out_call_count = self.debug.packets_out_call_count.load(.monotonic),
             .packets_out_sent_count = self.debug.packets_out_sent_count.load(.monotonic),
             .packets_out_eagain_count = self.debug.packets_out_eagain_count.load(.monotonic),
@@ -1258,6 +1317,7 @@ pub const QuicEngine = struct {
     ) !*QuicConnection {
         _ = io;
         log.debug("connect: initiating connection", .{});
+        counterInc(&self.debug.connect_attempt_count);
 
         // Create QuicConnection wrapper first so we can pass it as conn_ctx
         // to lsquic_engine_connect. This prevents onNewConn from creating a
@@ -1390,13 +1450,15 @@ pub const QuicEngine = struct {
             consecutive_errors = 0;
 
             log.debug("runReceiveLoop: received {} bytes", .{msg.data.len});
+            counterInc(&self.debug.udp_datagram_in_count);
+            counterAdd(&self.debug.udp_bytes_in, msg.data.len);
 
             // Convert IpAddress to sockaddr for lsquic
             var local_sa = ipAddressToSockaddr(sock.address);
             var peer_sa = ipAddressToSockaddr(msg.from);
 
             self.lockLsquic();
-            _ = lsquic.lsquic_engine_packet_in(
+            const packet_in_result = lsquic.lsquic_engine_packet_in(
                 self.engine,
                 msg.data.ptr,
                 msg.data.len,
@@ -1405,6 +1467,7 @@ pub const QuicEngine = struct {
                 @ptrCast(self),
                 0, // ecn
             );
+            if (packet_in_result != 0) counterInc(&self.debug.packet_in_error_count);
             self.unlockLsquic();
 
             self.processEngine();
@@ -1569,6 +1632,10 @@ pub const QuicEngine = struct {
             log.warn("onHskDone: handshake failed with status={}", .{status});
             // Signal failure to waitHandshake
             if (lc) |c| {
+                if (lsquic.lsquic_conn_get_ctx(c)) |ctx| {
+                    const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
+                    counterInc(&conn.engine.debug.handshake_failed_status_count);
+                }
                 const conn_ctx = lsquic.lsquic_conn_get_ctx(c);
                 if (conn_ctx) |ctx| {
                     const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
@@ -1590,6 +1657,7 @@ pub const QuicEngine = struct {
         const conn_ctx = lsquic.lsquic_conn_get_ctx(lc);
         if (conn_ctx) |ctx| {
             const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
+            counterInc(&conn.engine.debug.handshake_ok_count);
             conn.retainRef();
             defer conn.releaseRef();
             conn.hsk_completed = true;
@@ -1632,7 +1700,7 @@ pub const QuicEngine = struct {
     }
 
     fn onConnCloseFrame(
-        _: ?*lsquic.lsquic_conn_t,
+        lc: ?*lsquic.lsquic_conn_t,
         app_error: c_int,
         error_code: u64,
         reason: ?[*]const u8,
@@ -1642,6 +1710,17 @@ pub const QuicEngine = struct {
             r[0..@as(usize, @intCast(reason_len))]
         else
             "(none)";
+        if (lc) |c| {
+            if (lsquic.lsquic_conn_get_ctx(c)) |raw| {
+                const conn: *QuicConnection = @ptrCast(@alignCast(raw));
+                counterInc(&conn.engine.debug.conn_close_frame_count);
+                if (app_error == 0 and error_code == 0 and reason_len == 0) {
+                    counterInc(&conn.engine.debug.conn_close_frame_graceful_count);
+                } else {
+                    counterInc(&conn.engine.debug.conn_close_frame_error_count);
+                }
+            }
+        }
         if (app_error == 0 and error_code == 0 and reason_len == 0) {
             log.debug("CONNECTION_CLOSE received: graceful close", .{});
         } else {
@@ -1684,6 +1763,12 @@ pub const QuicEngine = struct {
             const conn: *QuicConnection = @ptrCast(@alignCast(raw));
             conn.retainRef();
             defer conn.releaseRef();
+            counterInc(&conn.engine.debug.conn_closed_count);
+            if (conn.hsk_completed) {
+                counterInc(&conn.engine.debug.conn_closed_after_handshake_count);
+            } else {
+                counterInc(&conn.engine.debug.conn_closed_before_handshake_count);
+            }
             conn.closed = true;
             conn.lsquic_conn = null;
             conn.engine.cert_verify_ctx.discardVerified(ctx);
