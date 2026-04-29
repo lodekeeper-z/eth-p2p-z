@@ -82,17 +82,27 @@ pub const QuicDebugStats = struct {
     handshake_ok_count: u64 = 0,
     handshake_failed_status_count: u64 = 0,
     handshake_failed_queue_closed_count: u64 = 0,
+    handshake_wait_closed_count: u64 = 0,
+    handshake_wait_canceled_count: u64 = 0,
+    handshake_delivery_closed_count: u64 = 0,
+    handshake_delivery_full_count: u64 = 0,
     handshake_failed_signal_count: u64 = 0,
     handshake_failed_missing_peer_id_count: u64 = 0,
     conn_close_frame_count: u64 = 0,
     conn_close_frame_graceful_count: u64 = 0,
     conn_close_frame_error_count: u64 = 0,
+    conn_close_frame_app_error_1_code_0_count: u64 = 0,
+    conn_close_frame_app_error_1_code_12_count: u64 = 0,
+    conn_close_frame_other_error_count: u64 = 0,
+    conn_close_called_before_handshake_count: u64 = 0,
+    conn_deinit_before_handshake_count: u64 = 0,
     conn_closed_count: u64 = 0,
     conn_closed_before_handshake_count: u64 = 0,
     conn_closed_after_handshake_count: u64 = 0,
     udp_datagram_in_count: u64 = 0,
     udp_bytes_in: u64 = 0,
     packet_in_error_count: u64 = 0,
+    packet_in_error_return_nonzero_count: u64 = 0,
     packets_out_call_count: u64 = 0,
     packets_out_sent_count: u64 = 0,
     packets_out_eagain_count: u64 = 0,
@@ -127,17 +137,27 @@ const DebugCounters = struct {
     handshake_ok_count: std.atomic.Value(u64) = .init(0),
     handshake_failed_status_count: std.atomic.Value(u64) = .init(0),
     handshake_failed_queue_closed_count: std.atomic.Value(u64) = .init(0),
+    handshake_wait_closed_count: std.atomic.Value(u64) = .init(0),
+    handshake_wait_canceled_count: std.atomic.Value(u64) = .init(0),
+    handshake_delivery_closed_count: std.atomic.Value(u64) = .init(0),
+    handshake_delivery_full_count: std.atomic.Value(u64) = .init(0),
     handshake_failed_signal_count: std.atomic.Value(u64) = .init(0),
     handshake_failed_missing_peer_id_count: std.atomic.Value(u64) = .init(0),
     conn_close_frame_count: std.atomic.Value(u64) = .init(0),
     conn_close_frame_graceful_count: std.atomic.Value(u64) = .init(0),
     conn_close_frame_error_count: std.atomic.Value(u64) = .init(0),
+    conn_close_frame_app_error_1_code_0_count: std.atomic.Value(u64) = .init(0),
+    conn_close_frame_app_error_1_code_12_count: std.atomic.Value(u64) = .init(0),
+    conn_close_frame_other_error_count: std.atomic.Value(u64) = .init(0),
+    conn_close_called_before_handshake_count: std.atomic.Value(u64) = .init(0),
+    conn_deinit_before_handshake_count: std.atomic.Value(u64) = .init(0),
     conn_closed_count: std.atomic.Value(u64) = .init(0),
     conn_closed_before_handshake_count: std.atomic.Value(u64) = .init(0),
     conn_closed_after_handshake_count: std.atomic.Value(u64) = .init(0),
     udp_datagram_in_count: std.atomic.Value(u64) = .init(0),
     udp_bytes_in: std.atomic.Value(u64) = .init(0),
     packet_in_error_count: std.atomic.Value(u64) = .init(0),
+    packet_in_error_return_nonzero_count: std.atomic.Value(u64) = .init(0),
     packets_out_call_count: std.atomic.Value(u64) = .init(0),
     packets_out_sent_count: std.atomic.Value(u64) = .init(0),
     packets_out_eagain_count: std.atomic.Value(u64) = .init(0),
@@ -728,6 +748,9 @@ pub const QuicConnection = struct {
 
     pub fn close(self: *QuicConnection, io: Io) void {
         _ = io;
+        if (!self.hsk_completed) {
+            counterInc(&self.engine.debug.conn_close_called_before_handshake_count);
+        }
         self.engine.lockLsquic();
         if (self.lsquic_conn) |lc| {
             // Clear conn context before closing so lsquic doesn't assert on destroy
@@ -785,10 +808,12 @@ pub const QuicConnection = struct {
         const result = self.hsk_queue.getOne(io) catch |err| switch (err) {
             error.Closed => {
                 counterInc(&self.engine.debug.handshake_failed_queue_closed_count);
+                counterInc(&self.engine.debug.handshake_wait_closed_count);
                 return error.HandshakeFailed;
             },
             error.Canceled => {
                 counterInc(&self.engine.debug.handshake_failed_queue_closed_count);
+                counterInc(&self.engine.debug.handshake_wait_canceled_count);
                 return error.HandshakeFailed;
             },
         };
@@ -805,6 +830,9 @@ pub const QuicConnection = struct {
     }
 
     pub fn deinit(self: *QuicConnection) void {
+        if (!self.hsk_completed) {
+            counterInc(&self.engine.debug.conn_deinit_before_handshake_count);
+        }
         self.engine.lockLsquic();
         if (self.lsquic_conn) |lc| {
             lsquic.lsquic_conn_set_ctx(lc, null);
@@ -1266,17 +1294,27 @@ pub const QuicEngine = struct {
             .handshake_ok_count = self.debug.handshake_ok_count.load(.monotonic),
             .handshake_failed_status_count = self.debug.handshake_failed_status_count.load(.monotonic),
             .handshake_failed_queue_closed_count = self.debug.handshake_failed_queue_closed_count.load(.monotonic),
+            .handshake_wait_closed_count = self.debug.handshake_wait_closed_count.load(.monotonic),
+            .handshake_wait_canceled_count = self.debug.handshake_wait_canceled_count.load(.monotonic),
+            .handshake_delivery_closed_count = self.debug.handshake_delivery_closed_count.load(.monotonic),
+            .handshake_delivery_full_count = self.debug.handshake_delivery_full_count.load(.monotonic),
             .handshake_failed_signal_count = self.debug.handshake_failed_signal_count.load(.monotonic),
             .handshake_failed_missing_peer_id_count = self.debug.handshake_failed_missing_peer_id_count.load(.monotonic),
             .conn_close_frame_count = self.debug.conn_close_frame_count.load(.monotonic),
             .conn_close_frame_graceful_count = self.debug.conn_close_frame_graceful_count.load(.monotonic),
             .conn_close_frame_error_count = self.debug.conn_close_frame_error_count.load(.monotonic),
+            .conn_close_frame_app_error_1_code_0_count = self.debug.conn_close_frame_app_error_1_code_0_count.load(.monotonic),
+            .conn_close_frame_app_error_1_code_12_count = self.debug.conn_close_frame_app_error_1_code_12_count.load(.monotonic),
+            .conn_close_frame_other_error_count = self.debug.conn_close_frame_other_error_count.load(.monotonic),
+            .conn_close_called_before_handshake_count = self.debug.conn_close_called_before_handshake_count.load(.monotonic),
+            .conn_deinit_before_handshake_count = self.debug.conn_deinit_before_handshake_count.load(.monotonic),
             .conn_closed_count = self.debug.conn_closed_count.load(.monotonic),
             .conn_closed_before_handshake_count = self.debug.conn_closed_before_handshake_count.load(.monotonic),
             .conn_closed_after_handshake_count = self.debug.conn_closed_after_handshake_count.load(.monotonic),
             .udp_datagram_in_count = self.debug.udp_datagram_in_count.load(.monotonic),
             .udp_bytes_in = self.debug.udp_bytes_in.load(.monotonic),
             .packet_in_error_count = self.debug.packet_in_error_count.load(.monotonic),
+            .packet_in_error_return_nonzero_count = self.debug.packet_in_error_return_nonzero_count.load(.monotonic),
             .packets_out_call_count = self.debug.packets_out_call_count.load(.monotonic),
             .packets_out_sent_count = self.debug.packets_out_sent_count.load(.monotonic),
             .packets_out_eagain_count = self.debug.packets_out_eagain_count.load(.monotonic),
@@ -1467,7 +1505,10 @@ pub const QuicEngine = struct {
                 @ptrCast(self),
                 0, // ecn
             );
-            if (packet_in_result != 0) counterInc(&self.debug.packet_in_error_count);
+            if (packet_in_result != 0) {
+                counterInc(&self.debug.packet_in_error_count);
+                counterInc(&self.debug.packet_in_error_return_nonzero_count);
+            }
             self.unlockLsquic();
 
             self.processEngine();
@@ -1644,10 +1685,12 @@ pub const QuicEngine = struct {
                     conn.retainRef();
                     defer conn.releaseRef();
                     const queued = tryQueueOneUncancelable(HandshakeResult, &conn.hsk_queue, conn.engine.io, .failed) catch {
+                        counterInc(&conn.engine.debug.handshake_delivery_closed_count);
                         lsquic.lsquic_conn_close(c);
                         return;
                     };
                     if (!queued) {
+                        counterInc(&conn.engine.debug.handshake_delivery_full_count);
                         lsquic.lsquic_conn_close(c);
                     }
                 }
@@ -1673,10 +1716,12 @@ pub const QuicEngine = struct {
             } else {
                 log.warn("onHskDone: no verified peer info from custom verify callback", .{});
                 const queued = tryQueueOneUncancelable(HandshakeResult, &conn.hsk_queue, conn.engine.io, .failed) catch {
+                    counterInc(&conn.engine.debug.handshake_delivery_closed_count);
                     if (lc) |c| lsquic.lsquic_conn_close(c);
                     return;
                 };
                 if (!queued) {
+                    counterInc(&conn.engine.debug.handshake_delivery_full_count);
                     if (lc) |c| lsquic.lsquic_conn_close(c);
                 }
                 if (lc) |c| lsquic.lsquic_conn_close(c);
@@ -1685,10 +1730,12 @@ pub const QuicEngine = struct {
 
             // Signal success to waitHandshake
             const queued = tryQueueOneUncancelable(HandshakeResult, &conn.hsk_queue, conn.engine.io, .ok) catch {
+                counterInc(&conn.engine.debug.handshake_delivery_closed_count);
                 if (lc) |c| lsquic.lsquic_conn_close(c);
                 return;
             };
             if (!queued) {
+                counterInc(&conn.engine.debug.handshake_delivery_full_count);
                 if (lc) |c| lsquic.lsquic_conn_close(c);
             }
 
@@ -1720,6 +1767,13 @@ pub const QuicEngine = struct {
                     counterInc(&conn.engine.debug.conn_close_frame_graceful_count);
                 } else {
                     counterInc(&conn.engine.debug.conn_close_frame_error_count);
+                    if (app_error == 1 and error_code == 0) {
+                        counterInc(&conn.engine.debug.conn_close_frame_app_error_1_code_0_count);
+                    } else if (app_error == 1 and error_code == 0xc) {
+                        counterInc(&conn.engine.debug.conn_close_frame_app_error_1_code_12_count);
+                    } else {
+                        counterInc(&conn.engine.debug.conn_close_frame_other_error_count);
+                    }
                 }
             }
         }

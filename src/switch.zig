@@ -39,17 +39,27 @@ fn zeroQuicDebugStats() QuicDebugStats {
         .handshake_ok_count = 0,
         .handshake_failed_status_count = 0,
         .handshake_failed_queue_closed_count = 0,
+        .handshake_wait_closed_count = 0,
+        .handshake_wait_canceled_count = 0,
+        .handshake_delivery_closed_count = 0,
+        .handshake_delivery_full_count = 0,
         .handshake_failed_signal_count = 0,
         .handshake_failed_missing_peer_id_count = 0,
         .conn_close_frame_count = 0,
         .conn_close_frame_graceful_count = 0,
         .conn_close_frame_error_count = 0,
+        .conn_close_frame_app_error_1_code_0_count = 0,
+        .conn_close_frame_app_error_1_code_12_count = 0,
+        .conn_close_frame_other_error_count = 0,
+        .conn_close_called_before_handshake_count = 0,
+        .conn_deinit_before_handshake_count = 0,
         .conn_closed_count = 0,
         .conn_closed_before_handshake_count = 0,
         .conn_closed_after_handshake_count = 0,
         .udp_datagram_in_count = 0,
         .udp_bytes_in = 0,
         .packet_in_error_count = 0,
+        .packet_in_error_return_nonzero_count = 0,
         .packets_out_call_count = 0,
         .packets_out_sent_count = 0,
         .packets_out_eagain_count = 0,
@@ -97,17 +107,27 @@ fn addQuicDebugStats(dest: *QuicDebugStats, src: QuicDebugStats) void {
     dest.handshake_ok_count += src.handshake_ok_count;
     dest.handshake_failed_status_count += src.handshake_failed_status_count;
     dest.handshake_failed_queue_closed_count += src.handshake_failed_queue_closed_count;
+    dest.handshake_wait_closed_count += src.handshake_wait_closed_count;
+    dest.handshake_wait_canceled_count += src.handshake_wait_canceled_count;
+    dest.handshake_delivery_closed_count += src.handshake_delivery_closed_count;
+    dest.handshake_delivery_full_count += src.handshake_delivery_full_count;
     dest.handshake_failed_signal_count += src.handshake_failed_signal_count;
     dest.handshake_failed_missing_peer_id_count += src.handshake_failed_missing_peer_id_count;
     dest.conn_close_frame_count += src.conn_close_frame_count;
     dest.conn_close_frame_graceful_count += src.conn_close_frame_graceful_count;
     dest.conn_close_frame_error_count += src.conn_close_frame_error_count;
+    dest.conn_close_frame_app_error_1_code_0_count += src.conn_close_frame_app_error_1_code_0_count;
+    dest.conn_close_frame_app_error_1_code_12_count += src.conn_close_frame_app_error_1_code_12_count;
+    dest.conn_close_frame_other_error_count += src.conn_close_frame_other_error_count;
+    dest.conn_close_called_before_handshake_count += src.conn_close_called_before_handshake_count;
+    dest.conn_deinit_before_handshake_count += src.conn_deinit_before_handshake_count;
     dest.conn_closed_count += src.conn_closed_count;
     dest.conn_closed_before_handshake_count += src.conn_closed_before_handshake_count;
     dest.conn_closed_after_handshake_count += src.conn_closed_after_handshake_count;
     dest.udp_datagram_in_count += src.udp_datagram_in_count;
     dest.udp_bytes_in += src.udp_bytes_in;
     dest.packet_in_error_count += src.packet_in_error_count;
+    dest.packet_in_error_return_nonzero_count += src.packet_in_error_return_nonzero_count;
     dest.packets_out_call_count += src.packets_out_call_count;
     dest.packets_out_sent_count += src.packets_out_sent_count;
     dest.packets_out_eagain_count += src.packets_out_eagain_count;
@@ -121,24 +141,44 @@ test "quic debug aggregation includes handshake and UDP counters" {
     src.connect_attempt_count = 2;
     src.handshake_ok_count = 3;
     src.handshake_failed_status_count = 4;
-    src.conn_close_frame_count = 5;
-    src.conn_closed_after_handshake_count = 6;
-    src.udp_datagram_in_count = 7;
-    src.udp_bytes_in = 800;
-    src.packet_in_error_count = 9;
-    src.packets_out_call_count = 10;
+    src.handshake_wait_closed_count = 5;
+    src.handshake_wait_canceled_count = 6;
+    src.handshake_delivery_closed_count = 7;
+    src.handshake_delivery_full_count = 8;
+    src.conn_close_frame_count = 9;
+    src.conn_close_frame_app_error_1_code_0_count = 10;
+    src.conn_close_frame_app_error_1_code_12_count = 11;
+    src.conn_close_frame_other_error_count = 12;
+    src.conn_close_called_before_handshake_count = 13;
+    src.conn_deinit_before_handshake_count = 14;
+    src.conn_closed_after_handshake_count = 15;
+    src.packet_in_error_return_nonzero_count = 16;
+    src.udp_datagram_in_count = 17;
+    src.udp_bytes_in = 1800;
+    src.packet_in_error_count = 19;
+    src.packets_out_call_count = 20;
 
     addQuicDebugStats(&dest, src);
 
     try std.testing.expectEqual(@as(u64, 2), dest.connect_attempt_count);
     try std.testing.expectEqual(@as(u64, 3), dest.handshake_ok_count);
     try std.testing.expectEqual(@as(u64, 4), dest.handshake_failed_status_count);
-    try std.testing.expectEqual(@as(u64, 5), dest.conn_close_frame_count);
-    try std.testing.expectEqual(@as(u64, 6), dest.conn_closed_after_handshake_count);
-    try std.testing.expectEqual(@as(u64, 7), dest.udp_datagram_in_count);
-    try std.testing.expectEqual(@as(u64, 800), dest.udp_bytes_in);
-    try std.testing.expectEqual(@as(u64, 9), dest.packet_in_error_count);
-    try std.testing.expectEqual(@as(u64, 10), dest.packets_out_call_count);
+    try std.testing.expectEqual(@as(u64, 5), dest.handshake_wait_closed_count);
+    try std.testing.expectEqual(@as(u64, 6), dest.handshake_wait_canceled_count);
+    try std.testing.expectEqual(@as(u64, 7), dest.handshake_delivery_closed_count);
+    try std.testing.expectEqual(@as(u64, 8), dest.handshake_delivery_full_count);
+    try std.testing.expectEqual(@as(u64, 9), dest.conn_close_frame_count);
+    try std.testing.expectEqual(@as(u64, 10), dest.conn_close_frame_app_error_1_code_0_count);
+    try std.testing.expectEqual(@as(u64, 11), dest.conn_close_frame_app_error_1_code_12_count);
+    try std.testing.expectEqual(@as(u64, 12), dest.conn_close_frame_other_error_count);
+    try std.testing.expectEqual(@as(u64, 13), dest.conn_close_called_before_handshake_count);
+    try std.testing.expectEqual(@as(u64, 14), dest.conn_deinit_before_handshake_count);
+    try std.testing.expectEqual(@as(u64, 15), dest.conn_closed_after_handshake_count);
+    try std.testing.expectEqual(@as(u64, 16), dest.packet_in_error_return_nonzero_count);
+    try std.testing.expectEqual(@as(u64, 17), dest.udp_datagram_in_count);
+    try std.testing.expectEqual(@as(u64, 1800), dest.udp_bytes_in);
+    try std.testing.expectEqual(@as(u64, 19), dest.packet_in_error_count);
+    try std.testing.expectEqual(@as(u64, 20), dest.packets_out_call_count);
 }
 const identity = @import("identity.zig");
 const multiaddr = @import("multiaddr");
