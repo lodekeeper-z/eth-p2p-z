@@ -1614,7 +1614,9 @@ pub const QuicEngine = struct {
             conn.peer_id = verified.peer_id;
             if (verified.host_pubkey.data) |d| conn.allocator.free(d);
             log.debug("onNewConn: server peer_id extracted from custom verify", .{});
+            counterInc(&engine.debug.handshake_ok_count);
         } else {
+            counterInc(&engine.debug.handshake_failed_missing_peer_id_count);
             log.warn("onNewConn: no verified peer info from custom verify callback", .{});
         }
 
