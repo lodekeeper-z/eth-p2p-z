@@ -162,6 +162,12 @@ pub fn Router(comptime Handler: type) type {
             control_ihave_total: u64 = 0,
             control_graft_total: u64 = 0,
             control_prune_total: u64 = 0,
+            control_ihave_message_ids_total: u64 = 0,
+            control_ihave_message_ids_missing_total: u64 = 0,
+            control_ihave_iwant_ids_sent_total: u64 = 0,
+            control_ihave_suppressed_seen_total: u64 = 0,
+            control_ihave_suppressed_budget_total: u64 = 0,
+            control_ihave_suppressed_rate_limit_total: u64 = 0,
         };
 
         /// v1.1: Per-peer score tracking.
@@ -625,8 +631,13 @@ pub fn Router(comptime Handler: type) type {
         }
 
         fn incrementTopicCounter(self: *Self, topic: []const u8, comptime field_name: []const u8) void {
+            self.incrementTopicCounterBy(topic, field_name, 1);
+        }
+
+        fn incrementTopicCounterBy(self: *Self, topic: []const u8, comptime field_name: []const u8, amount: u64) void {
+            if (amount == 0) return;
             const stats = self.debugTopicStatsPtr(topic) catch return;
-            @field(stats, field_name) += 1;
+            @field(stats, field_name) += amount;
         }
 
         /// Report the application validation outcome for a pending inbound
@@ -1226,21 +1237,43 @@ pub fn Router(comptime Handler: type) type {
             const count_gop = try getOrPutOwnedKey(&self.peer_ihave_count, self.allocator, from_peer);
             if (!count_gop.found_existing) count_gop.value_ptr.* = 0;
             count_gop.value_ptr.* += 1;
-            if (count_gop.value_ptr.* > self.config.max_ihave_messages) return;
+            if (count_gop.value_ptr.* > self.config.max_ihave_messages) {
+                const topic = ihave.getTopicID();
+                if (topic.len > 0) self.incrementTopicCounter(topic, "control_ihave_suppressed_rate_limit_total");
+                return;
+            }
 
             const asked_gop = try getOrPutOwnedKey(&self.peer_iasked, self.allocator, from_peer);
             if (!asked_gop.found_existing) asked_gop.value_ptr.* = 0;
-            if (asked_gop.value_ptr.* >= self.config.max_ihave_length) return;
+            if (asked_gop.value_ptr.* >= self.config.max_ihave_length) {
+                const topic = ihave.getTopicID();
+                if (topic.len > 0) self.incrementTopicCounter(topic, "control_ihave_suppressed_budget_total");
+                return;
+            }
+
+            const topic = ihave.getTopicID();
 
             // Collect message IDs we haven't seen
             var iwant_ids: std.ArrayList([]const u8) = .empty;
             defer iwant_ids.deinit(self.allocator);
 
             var ihave_var = ihave.*;
+            var total_ids: u64 = 0;
+            var missing_ids: u64 = 0;
+            var suppressed_seen: u64 = 0;
             while (ihave_var.messageIDsNext()) |mid| {
+                total_ids += 1;
                 if (self.mcache.entryState(mid) == .missing and !self.hasSeen(mid)) {
+                    missing_ids += 1;
                     try iwant_ids.append(self.allocator, mid);
+                } else {
+                    suppressed_seen += 1;
                 }
+            }
+            if (topic.len > 0) {
+                self.incrementTopicCounterBy(topic, "control_ihave_message_ids_total", total_ids);
+                self.incrementTopicCounterBy(topic, "control_ihave_message_ids_missing_total", missing_ids);
+                self.incrementTopicCounterBy(topic, "control_ihave_suppressed_seen_total", suppressed_seen);
             }
 
             if (iwant_ids.items.len == 0) return;
@@ -1251,12 +1284,19 @@ pub fn Router(comptime Handler: type) type {
             const budget = self.config.max_ihave_length -| asked_gop.value_ptr.*;
             const to_ask = @min(iwant_ids.items.len, budget);
             asked_gop.value_ptr.* += @intCast(to_ask);
+            if (topic.len > 0 and to_ask < iwant_ids.items.len) {
+                self.incrementTopicCounterBy(topic, "control_ihave_suppressed_budget_total", @intCast(iwant_ids.items.len - to_ask));
+            }
 
             // Send IWANT
             var optionals: [128]?[]const u8 = undefined;
             const count = @min(to_ask, 128);
             for (0..count) |i| {
                 optionals[i] = iwant_ids.items[i];
+            }
+            if (topic.len > 0) {
+                self.incrementTopicCounterBy(topic, "control_ihave_iwant_ids_sent_total", @intCast(count));
+                if (to_ask > count) self.incrementTopicCounterBy(topic, "control_ihave_suppressed_budget_total", @intCast(to_ask - count));
             }
             const iwant_msg = rpc.ControlIWant{
                 .message_i_ds = optionals[0..count],

@@ -791,6 +791,38 @@ test "Service exposes router debug stats snapshot" {
     try std.testing.expectEqual(@as(u64, 1), stats.message_manual_queued_total);
 }
 
+test "Service attributes IHAVE message IDs and generated IWANT by topic" {
+    const svc = try Service.init(std.testing.allocator, .{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = testMsgId,
+        .validation_mode = .manual,
+    });
+    defer svc.deinit(std.testing.io);
+
+    try svc.subscribe(std.testing.io, "test-topic");
+    try svc.addPeer(std.testing.io, "peer-1");
+
+    var mids = [_]?[]const u8{ "missing-1", "missing-2" };
+    var ihaves = [_]?rpc.ControlIHave{.{
+        .topic_i_d = "test-topic",
+        .message_i_ds = &mids,
+    }};
+    const ctrl = rpc.ControlMessage{ .ihave = &ihaves };
+    const rpc_msg = rpc.RPC{ .control = ctrl };
+    const encoded = rpc_msg.encode(std.testing.allocator) catch unreachable;
+    defer std.testing.allocator.free(encoded);
+
+    try svc.handleRpc(std.testing.io, "peer-1", encoded);
+
+    const topic_stats = svc.router.debugTopicStatsSnapshot("test-topic");
+    try std.testing.expectEqual(@as(u64, 1), topic_stats.control_ihave_total);
+    try std.testing.expectEqual(@as(u64, 2), topic_stats.control_ihave_message_ids_total);
+    try std.testing.expectEqual(@as(u64, 2), topic_stats.control_ihave_message_ids_missing_total);
+    try std.testing.expectEqual(@as(u64, 2), topic_stats.control_ihave_iwant_ids_sent_total);
+    try std.testing.expectEqual(@as(u64, 0), topic_stats.control_ihave_suppressed_seen_total);
+}
+
 test "Service subscribe, publish, heartbeat" {
     const svc = try Service.init(std.testing.allocator, test_config);
     defer svc.deinit(std.testing.io);
