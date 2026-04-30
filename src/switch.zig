@@ -38,6 +38,13 @@ fn zeroQuicDebugStats() QuicDebugStats {
         .connect_attempt_count = 0,
         .handshake_ok_count = 0,
         .handshake_failed_status_count = 0,
+        .cert_verify_callback_count = 0,
+        .cert_verify_no_conn_count = 0,
+        .cert_verify_no_peer_cert_count = 0,
+        .cert_verify_extract_error_count = 0,
+        .cert_verify_invalid_signature_count = 0,
+        .cert_verify_store_error_count = 0,
+        .cert_verify_ok_count = 0,
         .handshake_failed_queue_closed_count = 0,
         .handshake_wait_closed_count = 0,
         .handshake_wait_canceled_count = 0,
@@ -106,6 +113,13 @@ fn addQuicDebugStats(dest: *QuicDebugStats, src: QuicDebugStats) void {
     dest.connect_attempt_count += src.connect_attempt_count;
     dest.handshake_ok_count += src.handshake_ok_count;
     dest.handshake_failed_status_count += src.handshake_failed_status_count;
+    dest.cert_verify_callback_count += src.cert_verify_callback_count;
+    dest.cert_verify_no_conn_count += src.cert_verify_no_conn_count;
+    dest.cert_verify_no_peer_cert_count += src.cert_verify_no_peer_cert_count;
+    dest.cert_verify_extract_error_count += src.cert_verify_extract_error_count;
+    dest.cert_verify_invalid_signature_count += src.cert_verify_invalid_signature_count;
+    dest.cert_verify_store_error_count += src.cert_verify_store_error_count;
+    dest.cert_verify_ok_count += src.cert_verify_ok_count;
     dest.handshake_failed_queue_closed_count += src.handshake_failed_queue_closed_count;
     dest.handshake_wait_closed_count += src.handshake_wait_closed_count;
     dest.handshake_wait_canceled_count += src.handshake_wait_canceled_count;
@@ -141,6 +155,13 @@ test "quic debug aggregation includes handshake and UDP counters" {
     src.connect_attempt_count = 2;
     src.handshake_ok_count = 3;
     src.handshake_failed_status_count = 4;
+    src.cert_verify_callback_count = 41;
+    src.cert_verify_no_conn_count = 42;
+    src.cert_verify_no_peer_cert_count = 43;
+    src.cert_verify_extract_error_count = 44;
+    src.cert_verify_invalid_signature_count = 45;
+    src.cert_verify_store_error_count = 46;
+    src.cert_verify_ok_count = 47;
     src.handshake_wait_closed_count = 5;
     src.handshake_wait_canceled_count = 6;
     src.handshake_delivery_closed_count = 7;
@@ -163,6 +184,13 @@ test "quic debug aggregation includes handshake and UDP counters" {
     try std.testing.expectEqual(@as(u64, 2), dest.connect_attempt_count);
     try std.testing.expectEqual(@as(u64, 3), dest.handshake_ok_count);
     try std.testing.expectEqual(@as(u64, 4), dest.handshake_failed_status_count);
+    try std.testing.expectEqual(@as(u64, 41), dest.cert_verify_callback_count);
+    try std.testing.expectEqual(@as(u64, 42), dest.cert_verify_no_conn_count);
+    try std.testing.expectEqual(@as(u64, 43), dest.cert_verify_no_peer_cert_count);
+    try std.testing.expectEqual(@as(u64, 44), dest.cert_verify_extract_error_count);
+    try std.testing.expectEqual(@as(u64, 45), dest.cert_verify_invalid_signature_count);
+    try std.testing.expectEqual(@as(u64, 46), dest.cert_verify_store_error_count);
+    try std.testing.expectEqual(@as(u64, 47), dest.cert_verify_ok_count);
     try std.testing.expectEqual(@as(u64, 5), dest.handshake_wait_closed_count);
     try std.testing.expectEqual(@as(u64, 6), dest.handshake_wait_canceled_count);
     try std.testing.expectEqual(@as(u64, 7), dest.handshake_delivery_closed_count);

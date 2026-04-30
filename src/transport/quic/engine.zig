@@ -81,6 +81,13 @@ pub const QuicDebugStats = struct {
     connect_attempt_count: u64 = 0,
     handshake_ok_count: u64 = 0,
     handshake_failed_status_count: u64 = 0,
+    cert_verify_callback_count: u64 = 0,
+    cert_verify_no_conn_count: u64 = 0,
+    cert_verify_no_peer_cert_count: u64 = 0,
+    cert_verify_extract_error_count: u64 = 0,
+    cert_verify_invalid_signature_count: u64 = 0,
+    cert_verify_store_error_count: u64 = 0,
+    cert_verify_ok_count: u64 = 0,
     handshake_failed_queue_closed_count: u64 = 0,
     handshake_wait_closed_count: u64 = 0,
     handshake_wait_canceled_count: u64 = 0,
@@ -136,6 +143,13 @@ const DebugCounters = struct {
     connect_attempt_count: std.atomic.Value(u64) = .init(0),
     handshake_ok_count: std.atomic.Value(u64) = .init(0),
     handshake_failed_status_count: std.atomic.Value(u64) = .init(0),
+    cert_verify_callback_count: std.atomic.Value(u64) = .init(0),
+    cert_verify_no_conn_count: std.atomic.Value(u64) = .init(0),
+    cert_verify_no_peer_cert_count: std.atomic.Value(u64) = .init(0),
+    cert_verify_extract_error_count: std.atomic.Value(u64) = .init(0),
+    cert_verify_invalid_signature_count: std.atomic.Value(u64) = .init(0),
+    cert_verify_store_error_count: std.atomic.Value(u64) = .init(0),
+    cert_verify_ok_count: std.atomic.Value(u64) = .init(0),
     handshake_failed_queue_closed_count: std.atomic.Value(u64) = .init(0),
     handshake_wait_closed_count: std.atomic.Value(u64) = .init(0),
     handshake_wait_canceled_count: std.atomic.Value(u64) = .init(0),
@@ -927,6 +941,7 @@ pub const QuicConnection = struct {
 /// session being verified.
 pub const CertVerifyCtx = struct {
     allocator: Allocator,
+    debug: *DebugCounters,
     verified_by_conn: std.AutoHashMap(usize, VerifiedPeer),
     pending_server_verified: std.ArrayList(VerifiedPeer),
     pending_server_head: usize,
@@ -936,9 +951,10 @@ pub const CertVerifyCtx = struct {
         host_pubkey: keys.PublicKey,
     };
 
-    pub fn init(allocator: Allocator) CertVerifyCtx {
+    pub fn init(allocator: Allocator, debug: *DebugCounters) CertVerifyCtx {
         return .{
             .allocator = allocator,
+            .debug = debug,
             .verified_by_conn = std.AutoHashMap(usize, VerifiedPeer).init(allocator),
             .pending_server_verified = .empty,
             .pending_server_head = 0,
@@ -1101,7 +1117,8 @@ pub const QuicEngine = struct {
         errdefer allocator.destroy(self);
 
         self.allocator = allocator;
-        self.cert_verify_ctx = CertVerifyCtx.init(allocator);
+        self.debug = .{};
+        self.cert_verify_ctx = CertVerifyCtx.init(allocator, &self.debug);
         self.conn_queue_buf = undefined;
         self.socket = null;
         self.sockets = .empty;
@@ -1115,7 +1132,6 @@ pub const QuicEngine = struct {
         self.processing = .init(false);
         self.pending_server_conn = null;
         self.background = .init;
-        self.debug = .{};
 
         self.conn_queue = Io.Queue(ConnEvent).init(&self.conn_queue_buf);
 
@@ -1293,6 +1309,13 @@ pub const QuicEngine = struct {
             .connect_attempt_count = self.debug.connect_attempt_count.load(.monotonic),
             .handshake_ok_count = self.debug.handshake_ok_count.load(.monotonic),
             .handshake_failed_status_count = self.debug.handshake_failed_status_count.load(.monotonic),
+            .cert_verify_callback_count = self.debug.cert_verify_callback_count.load(.monotonic),
+            .cert_verify_no_conn_count = self.debug.cert_verify_no_conn_count.load(.monotonic),
+            .cert_verify_no_peer_cert_count = self.debug.cert_verify_no_peer_cert_count.load(.monotonic),
+            .cert_verify_extract_error_count = self.debug.cert_verify_extract_error_count.load(.monotonic),
+            .cert_verify_invalid_signature_count = self.debug.cert_verify_invalid_signature_count.load(.monotonic),
+            .cert_verify_store_error_count = self.debug.cert_verify_store_error_count.load(.monotonic),
+            .cert_verify_ok_count = self.debug.cert_verify_ok_count.load(.monotonic),
             .handshake_failed_queue_closed_count = self.debug.handshake_failed_queue_closed_count.load(.monotonic),
             .handshake_wait_closed_count = self.debug.handshake_wait_closed_count.load(.monotonic),
             .handshake_wait_canceled_count = self.debug.handshake_wait_canceled_count.load(.monotonic),
@@ -2138,9 +2161,11 @@ pub const QuicEngine = struct {
             return ssl.ssl_verify_invalid;
         };
         const ctx: *CertVerifyCtx = @ptrCast(@alignCast(raw_ptr));
+        counterInc(&ctx.debug.cert_verify_callback_count);
         const lsquic_ssl: *const lsquic.struct_ssl_st = @ptrCast(s);
         const lc = lsquic.lsquic_ssl_to_conn(lsquic_ssl) orelse {
             log.warn("customVerifyCallback: lsquic_ssl_to_conn returned null", .{});
+            counterInc(&ctx.debug.cert_verify_no_conn_count);
             if (out_alert) |a| a.* = ssl.SSL_AD_INTERNAL_ERROR;
             return ssl.ssl_verify_invalid;
         };
@@ -2148,6 +2173,7 @@ pub const QuicEngine = struct {
         // Get the peer certificate from the SSL connection
         const cert: *ssl.X509 = ssl.SSL_get_peer_certificate(s) orelse {
             log.warn("customVerifyCallback: no peer certificate — Lighthouse may not be sending a cert (mutual TLS not requested?)", .{});
+            counterInc(&ctx.debug.cert_verify_no_peer_cert_count);
             // Signal bad certificate alert
             if (out_alert) |a| a.* = ssl.SSL_AD_CERTIFICATE_UNKNOWN;
             return ssl.ssl_verify_invalid;
@@ -2159,12 +2185,14 @@ pub const QuicEngine = struct {
         // Verify the libp2p certificate extension and extract peer identity
         const info = tls.verifyAndExtractPeerInfo(ctx.allocator, cert) catch |err| {
             log.warn("customVerifyCallback: verifyAndExtractPeerInfo failed: {s}", .{@errorName(err)});
+            counterInc(&ctx.debug.cert_verify_extract_error_count);
             if (out_alert) |a| a.* = ssl.SSL_AD_BAD_CERTIFICATE;
             return ssl.ssl_verify_invalid;
         };
 
         if (!info.is_valid) {
             log.warn("customVerifyCallback: cert signature verification failed (extension sig mismatch)", .{});
+            counterInc(&ctx.debug.cert_verify_invalid_signature_count);
             if (info.host_pubkey.data) |d| ctx.allocator.free(d);
             if (out_alert) |a| a.* = ssl.SSL_AD_BAD_CERTIFICATE;
             return ssl.ssl_verify_invalid;
@@ -2184,11 +2212,13 @@ pub const QuicEngine = struct {
             .host_pubkey = info.host_pubkey,
         }) catch |err| {
             log.warn("customVerifyCallback: failed to store verified peer info: {s}", .{@errorName(err)});
+            counterInc(&ctx.debug.cert_verify_store_error_count);
             if (info.host_pubkey.data) |d| ctx.allocator.free(d);
             if (out_alert) |a| a.* = ssl.SSL_AD_INTERNAL_ERROR;
             return ssl.ssl_verify_invalid;
         };
 
+        counterInc(&ctx.debug.cert_verify_ok_count);
         log.debug("customVerifyCallback: peer verified successfully", .{});
         return ssl.ssl_verify_ok;
     }
@@ -2313,7 +2343,8 @@ test "new QUIC streams do not arm read callbacks before application read" {
 
 test "CertVerifyCtx stores and retrieves by connection context" {
     const allocator = std.testing.allocator;
-    var ctx = CertVerifyCtx.init(allocator);
+    var debug = DebugCounters{};
+    var ctx = CertVerifyCtx.init(allocator, &debug);
     defer ctx.deinit();
     const conn_ctx_a: *anyopaque = @ptrFromInt(0x1000);
 
@@ -2333,7 +2364,8 @@ test "CertVerifyCtx stores and retrieves by connection context" {
 
 test "CertVerifyCtx returns null when empty" {
     const allocator = std.testing.allocator;
-    var ctx = CertVerifyCtx.init(allocator);
+    var debug = DebugCounters{};
+    var ctx = CertVerifyCtx.init(allocator, &debug);
     defer ctx.deinit();
     const conn_ctx_a: *anyopaque = @ptrFromInt(0x1000);
 
@@ -2343,7 +2375,8 @@ test "CertVerifyCtx returns null when empty" {
 
 test "CertVerifyCtx keeps peer identities isolated per connection context" {
     const allocator = std.testing.allocator;
-    var ctx = CertVerifyCtx.init(allocator);
+    var debug = DebugCounters{};
+    var ctx = CertVerifyCtx.init(allocator, &debug);
     defer ctx.deinit();
     const conn_ctx_a: *anyopaque = @ptrFromInt(0x1000);
     const conn_ctx_b: *anyopaque = @ptrFromInt(0x2000);
@@ -2376,7 +2409,8 @@ test "CertVerifyCtx keeps peer identities isolated per connection context" {
 
 test "CertVerifyCtx preserves server-side verification order" {
     const allocator = std.testing.allocator;
-    var ctx = CertVerifyCtx.init(allocator);
+    var debug = DebugCounters{};
+    var ctx = CertVerifyCtx.init(allocator, &debug);
     defer ctx.deinit();
     const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
     const conn_b: *lsquic.lsquic_conn_t = @ptrFromInt(0x2000);
